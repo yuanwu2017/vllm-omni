@@ -863,21 +863,42 @@ async def omni_init_app_state(
     #   read it from there.
     # - pass `reasoning_parser` so render-time `adjust_request` runs for
     #   reasoning models (matches `vllm.entrypoints.openai.api_server`).
-    state.openai_serving_render = OpenAIServingRender(
-        model_config=engine_client.model_config,
-        renderer=engine_client.renderer,
-        model_registry=state.openai_serving_models.registry,
-        request_logger=request_logger,
-        chat_template=resolved_chat_template,
-        chat_template_content_format=args.chat_template_content_format,
-        trust_request_chat_template=args.trust_request_chat_template,
-        enable_auto_tools=args.enable_auto_tool_choice,
-        exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
-        tool_parser=args.tool_call_parser,
-        reasoning_parser=args.structured_outputs_config.reasoning_parser,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
-        log_error_stack=args.log_error_stack,
-    )
+    # - Pure diffusion servers (e.g. text-to-video) have no LLM model_config
+    #   and no chat/render surface, so OpenAIServingRender cannot be built
+    #   (it dereferences model_config.model). Skip it; /v1/videos and the other
+    #   diffusion endpoints do not use the render service. Chat/completions are
+    #   not served in this mode anyway.
+    if engine_client.model_config is not None:
+        state.openai_serving_render = OpenAIServingRender(
+            model_config=engine_client.model_config,
+            renderer=engine_client.renderer,
+            model_registry=state.openai_serving_models.registry,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            trust_request_chat_template=args.trust_request_chat_template,
+            enable_auto_tools=args.enable_auto_tool_choice,
+            exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
+            tool_parser=args.tool_call_parser,
+            reasoning_parser=args.structured_outputs_config.reasoning_parser,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            log_error_stack=args.log_error_stack,
+        )
+    else:
+        logger.warning(
+            "Skipping OpenAIServingRender: model_config is None (pure diffusion "
+            "mode). Chat/render endpoints are unavailable; diffusion endpoints "
+            "(e.g. /v1/videos) are unaffected."
+        )
+        state.openai_serving_render = None
+
+    # Pure diffusion servers (e.g. text-to-video) have no LLM model_config and
+    # cannot serve the text "generate" family (responses / chat / completions /
+    # tokens), which dereference model_config.model at construction. Drop the
+    # "generate" task so those LLM-only services below are skipped. The
+    # diffusion endpoints (/v1/videos etc.) are served by openai_serving_video.
+    if engine_client.model_config is None:
+        supported_tasks = tuple(t for t in supported_tasks if t != "generate")
 
     state.openai_serving_responses = (
         OpenAIServingResponses(
@@ -988,15 +1009,19 @@ async def omni_init_app_state(
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
         else None
     )
-    state.openai_serving_tokenization = OpenAIServingTokenization(
-        engine_client,
-        state.openai_serving_models,
-        state.openai_serving_render,
-        request_logger=request_logger,
-        chat_template=resolved_chat_template,
-        chat_template_content_format=args.chat_template_content_format,
-        default_chat_template_kwargs=args.default_chat_template_kwargs,
-        trust_request_chat_template=args.trust_request_chat_template,
+    state.openai_serving_tokenization = (
+        OpenAIServingTokenization(
+            engine_client,
+            state.openai_serving_models,
+            state.openai_serving_render,
+            request_logger=request_logger,
+            chat_template=resolved_chat_template,
+            chat_template_content_format=args.chat_template_content_format,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
+            trust_request_chat_template=args.trust_request_chat_template,
+        )
+        if engine_client.model_config is not None
+        else None
     )
     state.openai_serving_transcription = (
         OpenAIServingTranscription(
