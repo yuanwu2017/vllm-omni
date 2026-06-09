@@ -70,7 +70,11 @@ def normalize_diffusion_postprocess_output(
     )
 
 
-def format_empty_diffusion_outputs(request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+def format_empty_diffusion_outputs(
+    request: OmniDiffusionRequest,
+    *,
+    custom_output: dict[str, Any] | None = None,
+) -> list[OmniRequestOutput]:
     return [
         OmniRequestOutput.from_diffusion(
             request_id=request.request_id,
@@ -78,6 +82,7 @@ def format_empty_diffusion_outputs(request: OmniDiffusionRequest) -> list[OmniRe
             prompt=prompt,
             metrics={},
             latents=None,
+            custom_output=custom_output or {},
         )
         for prompt in request.prompts
     ]

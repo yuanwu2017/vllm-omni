@@ -324,7 +324,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(req)
+                    # Encode/Prefill-Decode disaggregation: a "text_encode"
+                    # stage runs ONLY the text encoder and emits prompt
+                    # embeddings for a downstream diffusion stage.
+                    if getattr(self.od_config, "model_stage", None) == "text_encode" and hasattr(
+                        self.pipeline, "encode"
+                    ):
+                        output = self.pipeline.encode(req)
+                    else:
+                        output = self.pipeline.forward(req)
 
             if is_primary:
                 self._record_peak_memory(output)
