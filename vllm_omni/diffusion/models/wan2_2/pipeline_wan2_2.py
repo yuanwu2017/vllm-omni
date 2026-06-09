@@ -315,6 +315,12 @@ class Wan22Pipeline(
 
         self.boundary_ratio = od_config.boundary_ratio
 
+        # Encode-only role (Encode/Prefill-Decode disaggregation): this stage
+        # runs ONLY the text encoder (UMT5) and emits prompt embeddings for a
+        # downstream diffusion stage. Skip loading the DiT transformer(s) and
+        # VAE to save memory; ``forward`` is never called on this stage.
+        self.encode_only = getattr(od_config, "model_stage", None) == "text_encode"
+
         # Determine which transformers to load based on boundary_ratio
         # boundary_ratio=1.0: only load transformer_2 (low-noise stage only)
         # boundary_ratio=0.0: only load transformer (high-noise stage only)
@@ -323,6 +329,9 @@ class Wan22Pipeline(
         load_transformer_2 = self.has_transformer_2 and (
             self.boundary_ratio != 0.0 if self.boundary_ratio is not None else True
         )
+        if self.encode_only:
+            load_transformer = False
+            load_transformer_2 = False
 
         # Set up weights sources for transformer(s)
         self.weights_sources = []
@@ -374,14 +383,17 @@ class Wan22Pipeline(
             local_files_only=local_files_only,
             torch_dtype=dtype,
         ).to(self.device)
-        self.vae = from_pretrained_with_prefetch(
-            DistributedAutoencoderKLWan.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=component_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=dtype,
-        ).to(self.device)
+        if self.encode_only:
+            self.vae = None
+        else:
+            self.vae = from_pretrained_with_prefetch(
+                DistributedAutoencoderKLWan.from_pretrained,
+                model,
+                subfolder="vae",
+                prefetch_list=component_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=dtype,
+            ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
@@ -401,6 +413,10 @@ class Wan22Pipeline(
             self.transformer_config = self.transformer.config
         elif load_transformer_2:
             self.transformer_config = self.transformer_2.config
+        elif self.encode_only:
+            # Encode-only stage has no transformer; ``forward`` is never called
+            # so a transformer config is not required.
+            self.transformer_config = None
         else:
             raise RuntimeError("No transformer loaded")
 
@@ -540,6 +556,51 @@ class Wan22Pipeline(
 
         return latents
 
+    def encode(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Run only the text encoder and emit prompt embeddings.
+
+        This is the "encode" stage of Encode/Prefill-Decode disaggregation.
+        It runs UMT5 on the prompt (and the negative prompt when CFG is
+        requested) and returns the embeddings in ``DiffusionOutput.custom_output``
+        so a downstream diffusion stage can consume them via ``prompt_embeds`` /
+        ``negative_prompt_embeds`` and skip text encoding entirely.
+        """
+        if len(req.prompts) != 1:
+            raise ValueError("Wan encode stage supports exactly one prompt per request.")
+
+        prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
+        negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+        if prompt is None:
+            raise ValueError("Prompt is required for the Wan text-encode stage.")
+
+        device = self.device
+        dtype = self.text_encoder.dtype
+
+        guidance_scale = req.sampling_params.guidance_scale or 1.0
+        guidance_scale_2 = req.sampling_params.guidance_scale_2
+        do_classifier_free_guidance = guidance_scale > 1.0 or (
+            guidance_scale_2 is not None and guidance_scale_2 > 1.0
+        )
+
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+            max_sequence_length=req.sampling_params.max_sequence_length or 512,
+            device=device,
+            dtype=dtype,
+        )
+
+        custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds}
+        if negative_prompt_embeds is not None:
+            custom_output["negative_prompt_embeds"] = negative_prompt_embeds
+
+        # ``to_cpu`` moves the embedding tensors off-device at construction so
+        # they can cross a process / connector boundary to the decode stage
+        # without pinning a CUDA/XPU context on the receiver.
+        return DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True)
+
     def forward(
         self,
         req: DiffusionRequestBatch,
@@ -566,6 +627,22 @@ class Wan22Pipeline(
         if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
             prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
             negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+            # Encode/Prefill-Decode disaggregation: a precomputed text-encoder
+            # output may arrive in the prompt dict (emitted by an upstream
+            # ``text_encode`` stage). When present it takes precedence over the
+            # kwargs and bypasses ``encode_prompt`` below.
+            if not isinstance(req.prompts[0], str):
+                if prompt_embeds is None and req.prompts[0].get("prompt_embeds") is not None:
+                    prompt_embeds = req.prompts[0].get("prompt_embeds")
+                if negative_prompt_embeds is None and req.prompts[0].get("negative_prompt_embeds") is not None:
+                    negative_prompt_embeds = req.prompts[0].get("negative_prompt_embeds")
+            # ``check_inputs`` (diffusers semantics) forbids passing both the
+            # raw text and its precomputed embedding. When embeddings are
+            # supplied they take precedence, so drop the raw prompt text.
+            if prompt_embeds is not None:
+                prompt = None
+            if negative_prompt_embeds is not None:
+                negative_prompt = None
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
@@ -976,6 +1053,13 @@ class Wan22Pipeline(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""
+        if self.encode_only:
+            # Encode-only stage: the UMT5 text encoder is fully loaded via
+            # ``from_pretrained`` in ``__init__`` and there are no DiT/VAE
+            # weight sources for this stage. Return ``None`` so the loader skips
+            # its strict coverage check (which would otherwise flag the
+            # pre-loaded ``text_encoder.*`` params as "not initialized").
+            return None
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 

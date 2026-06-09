@@ -1,0 +1,80 @@
+# Stage config for running Wan2.1-T2V on Intel XPU as a TWO-stage
+# Encode/(Prefill+Decode) disaggregated pipeline (BF16).
+#
+#   Stage 0 (text_encode): UMT5 text encoder only -> prompt embeddings.
+#   Stage 1 (dit):         DiT denoise + VAE decode -> video, consuming the
+#                          stage-0 embeddings (no text encoding in stage 1).
+#
+# This is the disaggregated counterpart of ./wan2_2.yaml (single-stage). It is
+# OPT-IN: select it explicitly with --stage-configs-path; the single-stage
+# config remains the default for Wan.
+#
+# The cross-stage handoff threads stage-0's DiffusionOutput.custom_output
+# (prompt_embeds / negative_prompt_embeds) into stage-1's prompt dict via
+# vllm_omni.model_executor.stage_input_processors.wan_encode.encode2diffusion.
+#
+# enforce_eager is required on XPU for the Wan transformer (rotary embedding is
+# built inside WanSelfAttention.forward, which breaks torch.compile).
+#
+# Launch:
+#   python -m dynamo.vllm.omni \
+#     --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+#     --stage-configs-path <this file> \
+#     --output-modalities video
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      process: true
+      # Visible-device ordinal; the launch script pins the physical device via
+      # ZE_AFFINITY_MASK. Encode is light; it can share card 0 with the DiT
+      # stage during bring-up, or be split onto its own card.
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      # Text-encode-only stage: Wan22Pipeline loads ONLY the UMT5 text encoder
+      # and tokenizer (no DiT / VAE) when model_stage == "text_encode".
+      model_stage: text_encode
+      model_class_name: WanPipeline
+      max_num_seqs: 1
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      # Surface the emitted embeddings on the stage request output's
+      # custom_output so the orchestrator forwards them downstream.
+      engine_output_type: custom
+      parallel_config:
+        tensor_parallel_size: 1
+    final_output: false
+
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      model_class_name: WanPipeline
+      max_num_seqs: 1
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      vae_use_tiling: true
+      engine_output_type: video
+      parallel_config:
+        tensor_parallel_size: 1
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.wan_encode.encode2diffusion
+    final_output: true
+    final_output_type: video
+    is_comprehension: false
+    default_sampling_params:
+      seed: 42
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
