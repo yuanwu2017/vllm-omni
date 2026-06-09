@@ -1,0 +1,55 @@
+# Stage config for running Wan2.2 on Intel XPU (single-stage diffusion, BF16).
+#
+# This is the XPU counterpart of ../../../model_executor/stage_configs/wan2_2_ti2v_dit_fp8.yaml.
+# Differences vs. the CUDA FP8 config:
+#   * BF16 (no ModelOpt FP8): FP8 on XPU is not the default lever here.
+#   * enforce_eager: required on XPU for the Wan2.2 transformer (the rotary
+#     embedding is constructed inside WanSelfAttention.forward, which breaks
+#     torch.compile). Same workaround as the CUDA launch script.
+#   * VAE tiling on by default for resolution/clip-length headroom.
+#
+# Single XPU is sufficient for Wan2.1-T2V-1.3B and Wan2.2 TI2V-5B in BF16.
+# For the A14B MoE variants, bump tensor_parallel_size and `devices`.
+#
+# Launch (single stage, aggregated worker):
+#   python -m dynamo.vllm.omni \
+#     --model Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+#     --stage-configs-path <this file> \
+#     --output-modalities video
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      process: true
+      # XPU device index; the launch script pins the physical device via
+      # ZE_AFFINITY_MASK, so "0" here is the visible-device ordinal.
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      # Wan22Pipeline auto-detects the model variant (T2V / TI2V / I2V) from
+      # model_index.json, so the same class serves Wan2.1-T2V-1.3B and TI2V-5B.
+      model_class_name: Wan22Pipeline
+      max_num_seqs: 1
+      # Required on XPU: see file header.
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      # Tile the VAE decode by default; negligible cost at 480p, adds headroom
+      # for higher resolutions / longer clips. Override with --vae-use-tiling false.
+      vae_use_tiling: true
+      parallel_config:
+        tensor_parallel_size: 1
+
+    final_output: true
+    final_output_type: video
+    is_comprehension: false
+    default_sampling_params:
+      seed: 42
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
