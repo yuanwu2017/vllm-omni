@@ -63,6 +63,10 @@ stage_args:
       distributed_executor_backend: "mp"
       vae_use_tiling: true
       engine_output_type: video
+      # EPD decode stage: prompt embeddings arrive from stage 0, so skip loading
+      # the ~10 GiB UMT5 text encoder entirely (it is dead weight here). This is
+      # the bulk of the EPD memory win on the decode card.
+      skip_text_encoder: true
       parallel_config:
         tensor_parallel_size: 1
     engine_input_source: [0]

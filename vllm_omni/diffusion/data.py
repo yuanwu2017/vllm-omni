@@ -438,6 +438,13 @@ class OmniDiffusionConfig:
     # diffusion stage (Encode/Prefill-Decode disaggregation).
     model_stage: str | None = None
 
+    # EPD decode stage: when True, skip loading the text encoder entirely — the
+    # prompt embeddings arrive from an upstream ``text_encode`` stage, so the
+    # large UMT5 encoder is dead weight on the decode card. No effect on a
+    # ``text_encode`` stage (which must load the encoder) or on an aggregated
+    # single-stage pipeline (which encodes its own text).
+    skip_text_encoder: bool = False
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)

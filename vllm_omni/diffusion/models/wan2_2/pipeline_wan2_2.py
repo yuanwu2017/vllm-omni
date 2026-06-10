@@ -309,6 +309,12 @@ class Wan22Pipeline(
         # VAE to save memory; ``forward`` is never called on this stage.
         self.encode_only = getattr(od_config, "model_stage", None) == "text_encode"
 
+        # EPD decode stage: prompt embeddings arrive from an upstream
+        # text_encode stage, so the ~10 GiB UMT5 encoder is never used here.
+        # Skipping it frees the bulk of the model's weight memory on decode
+        # cards. Never skip on an encode-only stage (it IS the encoder).
+        self.skip_text_encoder = bool(getattr(od_config, "skip_text_encoder", False)) and not self.encode_only
+
         # Determine which transformers to load based on boundary_ratio
         # boundary_ratio=1.0: only load transformer_2 (low-noise stage only)
         # boundary_ratio=0.0: only load transformer (high-noise stage only)
@@ -370,7 +376,7 @@ class Wan22Pipeline(
             prefetch_list=component_subfolders,
             local_files_only=local_files_only,
             torch_dtype=dtype,
-        ).to(self.device)
+        ).to(self.device) if not self.skip_text_encoder else None
         if self.encode_only:
             self.vae = None
         else:
@@ -570,15 +576,21 @@ class Wan22Pipeline(
             guidance_scale_2 is not None and guidance_scale_2 > 1.0
         )
 
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-            max_sequence_length=req.sampling_params.max_sequence_length or 512,
-            device=device,
-            dtype=dtype,
-        )
+        # ``torch.no_grad()`` is essential here: the text encoder runs in
+        # inference but without it autograd builds a graph and retains
+        # activations every call. On an encode-only stage that serves many
+        # requests back-to-back this leaks device memory until the worker is
+        # killed (a silent native OOM on XPU), so wrap the encode explicitly.
+        with torch.no_grad():
+            prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=do_classifier_free_guidance,
+                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
+                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                device=device,
+                dtype=dtype,
+            )
 
         custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds}
         if negative_prompt_embeds is not None:
@@ -633,6 +645,29 @@ class Wan22Pipeline(
                 negative_prompt = None
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
+        # When the text encoder was skipped (EPD decode stage), embeddings MUST
+        # arrive from the upstream encode stage; encoding here is impossible.
+        # The warmup dummy run has no upstream, so synthesize zero embeddings of
+        # the UMT5 output shape (1, max_seq_len, 4096) to still exercise the DiT.
+        if self.skip_text_encoder and prompt_embeds is None:
+            if req.is_dummy_run():
+                max_seq_len = req.sampling_params.max_sequence_length or 512
+                text_dim = getattr(self.transformer_config, "text_dim", 4096) or 4096
+                prompt_embeds = torch.zeros(
+                    (1, max_seq_len, text_dim), device=self.device, dtype=self.transformer.dtype
+                )
+                # Provide matching negative embeddings so a warmup that enables
+                # classifier-free guidance does not fail the embeds-pairing check.
+                if negative_prompt_embeds is None:
+                    negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+                prompt = None
+                negative_prompt = None
+            else:
+                raise ValueError(
+                    "skip_text_encoder is set but no prompt_embeds were provided. "
+                    "An EPD decode stage requires an upstream text_encode stage to "
+                    "supply prompt_embeds (and negative_prompt_embeds)."
+                )
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
