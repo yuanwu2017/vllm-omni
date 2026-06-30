@@ -459,15 +459,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
                 with record_function(record_name):
-                    # Encode/Generation (EG) disaggregation: a text_encode
-                    # stage runs only the text encoder and emits prompt
-                    # embeddings for a downstream diffusion stage.
-                    if (
-                        allow_single_output
-                        and getattr(od_config, "model_stage", None) == "text_encode"
-                        and hasattr(self.pipeline, "encode")
-                    ):
-                        raw_outputs = self.pipeline.encode(reqs[0])
+                    # Stage dispatch is owned by the pipeline: pipelines that
+                    # support per-stage roles (e.g. Encode/Generation (EG)
+                    # disaggregation) expose ``run_stage`` and decide internally
+                    # whether to encode only or run the full forward pass.
+                    run_stage = getattr(self.pipeline, "run_stage", None)
+                    if allow_single_output and callable(run_stage):
+                        raw_outputs = run_stage(batch)
                     else:
                         raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(

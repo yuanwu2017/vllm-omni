@@ -556,6 +556,18 @@ class Wan22Pipeline(
 
         return latents
 
+    def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
+        """Dispatch to the computation for this pipeline's stage role.
+
+        Centralizes Encode/Generation (EG) disaggregation dispatch so the
+        model runner stays stage-agnostic: an encode-only stage runs just the
+        text encoder, while every other stage runs the full diffusion forward
+        pass.
+        """
+        if self.encode_only:
+            return self.encode(batch.requests[0])
+        return self.forward(batch)
+
     def encode(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """Run only the text encoder and emit prompt embeddings.
 
