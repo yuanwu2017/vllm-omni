@@ -345,9 +345,11 @@ class NixlConnector(OmniConnectorBase):
         dtype = getattr(torch, dtype_name, None)
         if dtype is None:
             raise RuntimeError(f"Unsupported NIXL tensor dtype: {spec.get('dtype')!r}")
-        device = torch.device("cpu") if kind == _KIND_OBJECT else self._receive_device or self._parse_device(
-            spec.get("device")
-        ) or torch.device("cpu")
+        device = (
+            torch.device("cpu")
+            if kind == _KIND_OBJECT
+            else self._receive_device or self._parse_device(spec.get("device")) or torch.device("cpu")
+        )
         return torch.empty(tuple(int(dim) for dim in shape), dtype=dtype, device=device)
 
     @staticmethod

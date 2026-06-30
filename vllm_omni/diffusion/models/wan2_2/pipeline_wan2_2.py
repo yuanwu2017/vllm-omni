@@ -578,9 +578,7 @@ class Wan22Pipeline(
 
         guidance_scale = req.sampling_params.guidance_scale or 1.0
         guidance_scale_2 = req.sampling_params.guidance_scale_2
-        do_classifier_free_guidance = guidance_scale > 1.0 or (
-            guidance_scale_2 is not None and guidance_scale_2 > 1.0
-        )
+        do_classifier_free_guidance = guidance_scale > 1.0 or (guidance_scale_2 is not None and guidance_scale_2 > 1.0)
 
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt=prompt,
