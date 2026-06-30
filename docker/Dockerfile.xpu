@@ -16,6 +16,17 @@ RUN apt clean && apt-get update -y && \
     curl \
     ffmpeg \
     git \
+    build-essential \
+    cmake \
+    ninja-build \
+    autotools-dev \
+    automake \
+    libtool \
+    libtool-bin \
+    pkg-config \
+    patchelf \
+    libibverbs-dev \
+    librdmacm-dev \
     libsndfile1 \
     libsm6 \
     libxext6 \
@@ -82,6 +93,34 @@ WORKDIR /workspace/
 
 ENV UV_HTTP_TIMEOUT=500
 
+ARG UCX_PR_REF=pull/11218/head
+RUN git clone https://github.com/openucx/ucx.git /tmp/ucx && \
+    cd /tmp/ucx && \
+    git fetch origin ${UCX_PR_REF}:ucx-pr-11218 && \
+    git checkout ucx-pr-11218 && \
+    ./autogen.sh && \
+    ./contrib/configure-release-mt \
+        --prefix=/usr/local \
+        --enable-shared \
+        --disable-static \
+        --disable-doxygen-doc \
+        --enable-optimizations \
+        --enable-cma \
+        --enable-devel-headers \
+        --enable-mt \
+        --with-ze \
+        --with-verbs \
+        --with-rdmacm \
+        --without-cuda \
+        --without-rocm \
+        --without-gdrcopy && \
+    make -j"$(nproc)" install-strip && \
+    ldconfig && \
+    rm -rf /tmp/ucx
+
+ENV PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
+ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/ucx:$LD_LIBRARY_PATH"
+
 # Configure package index for XPU
 ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 ENV UV_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
@@ -94,9 +133,9 @@ WORKDIR /workspace/vllm
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --upgrade pip && \
-    uv pip install -r requirements/xpu.txt && \
-    uv pip install setuptools_scm &&\
-    uv pip install grpcio-tools protobuf nanobind && \
+    uv pip install --no-cache -r requirements/xpu.txt && \
+    uv pip install --no-cache setuptools_scm &&\
+    uv pip install --no-cache grpcio-tools protobuf nanobind && \
     source /opt/intel/oneapi/setvars.sh --force && \
     source /opt/intel/oneapi/ccl/2021.15/env/vars.sh --force && \
     export CMAKE_PREFIX_PATH="$(python3 -c 'import site; print(site.getsitepackages()[0])'):${CMAKE_PREFIX_PATH}"
@@ -107,18 +146,30 @@ ENV VLLM_TARGET_DEVICE=xpu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-build-isolation .
+    uv pip install --no-cache --no-build-isolation .
+
+ARG NIXL_VERSION=v1.3.0
+RUN --mount=type=cache,target=/root/.cache/uv \
+    git clone --depth 1 --branch ${NIXL_VERSION} https://github.com/ai-dynamo/nixl.git /tmp/nixl && \
+    cd /tmp/nixl && \
+    uv pip install --no-cache meson meson-python ninja pybind11 tomlkit pyyaml build && \
+    uv pip install --no-cache --no-build-isolation --no-deps . && \
+    meson setup build \
+        -Ducx_path=/usr/local \
+        -Denable_plugins=UCX \
+        -Ddisable_gds_backend=true && \
+    ninja -C build install && \
+    uv pip install --no-cache build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl && \
+    python -c "import nixl; agent = nixl.nixl_agent('agent1')" && \
+    rm -rf /tmp/nixl
 
 CMD ["/bin/bash"]
 
 FROM vllm-base AS vllm-openai
 
-# install nixl from source code
-RUN uv pip install nixl
-
 # install additional dependencies for openai api server
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install accelerate hf_transfer pytest pytest_asyncio lm_eval[api] modelscope
+    uv pip install --no-cache accelerate hf_transfer pytest pytest_asyncio lm_eval[api] modelscope
 
 # install development dependencies (for testing)
 RUN uv pip install -e tests/vllm_test_utils
@@ -145,7 +196,7 @@ ENV VLLM_OMNI_TARGET_DEVICE=xpu
 RUN --mount=type=cache,target=/root/.cache/uv \
     echo "triton @ https://example.com/blocked" > /tmp/vllm_omni_constraints.txt && \
     PIP_CONSTRAINT=/tmp/vllm_omni_constraints.txt \
-    uv pip install --no-build-isolation \
+    uv pip install --no-cache --no-build-isolation \
     --extra-index-url https://mirrors.ustc.edu.cn/pypi/simple/ \
     ".[dev]" && \
     uv pip uninstall oneccl oneccl-devel
