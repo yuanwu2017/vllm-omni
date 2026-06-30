@@ -32,8 +32,8 @@ stage_args:
     runtime:
       process: true
       # Visible-device ordinal; the launch script pins the physical device via
-      # ZE_AFFINITY_MASK. Encode is light; it can share card 0 with the DiT
-      # stage during bring-up, or be split onto its own card.
+      # ZE_AFFINITY_MASK. Encode is light and runs on its own card (0); the DiT
+      # stage runs on card 1 so the two processes do not share a GPU.
       devices: "0"
       max_batch_size: 1
     engine_args:
@@ -58,7 +58,7 @@ stage_args:
     stage_type: diffusion
     runtime:
       process: true
-      devices: "0"
+      devices: "1"
       max_batch_size: 1
     engine_args:
       model_stage: dit
