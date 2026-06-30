@@ -565,11 +565,11 @@ class Wan22Pipeline(
         so a downstream diffusion stage can consume them via ``prompt_embeds`` /
         ``negative_prompt_embeds`` and skip text encoding entirely.
         """
-        if len(req.prompts) != 1:
-            raise ValueError("Wan encode stage supports exactly one prompt per request.")
+        if req.prompt is None:
+            raise ValueError("Prompt is required for the Wan text-encode stage.")
 
-        prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
-        negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+        prompt = req.prompt if isinstance(req.prompt, str) else req.prompt.get("prompt")
+        negative_prompt = None if isinstance(req.prompt, str) else req.prompt.get("negative_prompt")
         if prompt is None:
             raise ValueError("Prompt is required for the Wan text-encode stage.")
 
