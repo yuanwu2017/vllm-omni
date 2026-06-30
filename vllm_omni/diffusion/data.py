@@ -577,6 +577,12 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Multi-stage diffusion role. ``None``/"dit"/"diffusion" run the full
+    # pipeline (text-encode + denoise + decode) in one stage. "text_encode"
+    # runs only the text encoder and emits prompt embeddings for a downstream
+    # diffusion stage (Encode/Generation (EG) disaggregation).
+    model_stage: str | None = None
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)

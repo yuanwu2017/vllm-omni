@@ -75,6 +75,7 @@ def format_empty_diffusion_outputs(
     request: OmniDiffusionRequest,
     *,
     finished: bool = True,
+    custom_output: dict[str, Any] | None = None,
 ) -> list[OmniRequestOutput]:
     return [
         OmniRequestOutput.from_diffusion(
@@ -84,6 +85,7 @@ def format_empty_diffusion_outputs(
             metrics={},
             latents=None,
             finished=finished,
+            custom_output=custom_output or {},
         )
     ]
 

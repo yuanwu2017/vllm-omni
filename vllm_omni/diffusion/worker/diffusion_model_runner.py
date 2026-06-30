@@ -459,7 +459,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
                 with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
+                    # Encode/Generation (EG) disaggregation: a text_encode
+                    # stage runs only the text encoder and emits prompt
+                    # embeddings for a downstream diffusion stage.
+                    if (
+                        allow_single_output
+                        and getattr(od_config, "model_stage", None) == "text_encode"
+                        and hasattr(self.pipeline, "encode")
+                    ):
+                        raw_outputs = self.pipeline.encode(reqs[0])
+                    else:
+                        raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(
                         raw_outputs,
                         expected_count=len(reqs),
