@@ -86,7 +86,8 @@ def encode2diffusion(
                 next_prompt[key] = original_prompt[key]
 
         prompt_embeds = custom_output.get("prompt_embeds")
-        if prompt_embeds is None:
+        embed_handle = custom_output.get("_encode_embed_transfer")
+        if prompt_embeds is None and embed_handle is None:
             logger.warning(
                 "[encode2diffusion] request %d: no prompt_embeds in upstream "
                 "custom_output (keys=%s); falling back to raw-text encoding.",
@@ -97,6 +98,10 @@ def encode2diffusion(
             for key in _EMBED_KEYS:
                 if custom_output.get(key) is not None:
                     next_prompt[key] = custom_output[key]
+        # Forward the connector transfer handle (if any) so the generation
+        # stage can pull the embeddings worker-to-worker over NIXL/UCX.
+        if embed_handle is not None:
+            next_prompt["_encode_embed_transfer"] = embed_handle
 
         diffusion_inputs.append(next_prompt)
 

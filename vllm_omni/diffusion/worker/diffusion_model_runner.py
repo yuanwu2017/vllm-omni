@@ -323,6 +323,124 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         return peak_memory_mb
 
+    # ------------------------------------------------------------------
+    # Encode/Generation (EG) disaggregation: worker-to-worker prompt-embedding
+    # transfer over the configured OmniConnector (e.g. NixlConnector/UCX)
+    # instead of inlining the embedding tensors through the orchestrator ZMQ
+    # path.  Applies to any diffusion pipeline that splits a text/prompt encode
+    # stage from the generation stage.
+    # ------------------------------------------------------------------
+    def _encode_embed_connector(self):
+        """Return the lazily-initialized OmniConnector for the encode edge, or None.
+
+        The connector is configured on the stage's ``omni_kv_config`` from the
+        YAML ``output_connectors``/``input_connectors`` edge; accessing the
+        property instantiates it on first use.  Any failure (e.g. NIXL not
+        installed) degrades to ``None`` so the caller falls back to the inline
+        embedding path.
+        """
+        mgr = getattr(self, "kv_transfer_manager", None)
+        if mgr is None:
+            return None
+        try:
+            return mgr.connector
+        except Exception:
+            logger.exception("[encode-eg] failed to initialize embedding connector")
+            return None
+
+    def _maybe_send_encode_embeds(self, reqs: list, outputs: list) -> None:
+        """Sender hook: register text_encode embeddings for connector transfer.
+
+        Runs only on the ``text_encode`` stage.  For each output carrying
+        ``prompt_embeds``, ``put`` the embedding payload into the connector and
+        stash the returned transfer handle on ``custom_output`` so the
+        downstream DiT stage can ``get`` it.  The inline embeddings are left in
+        place as a fallback.
+        """
+        if getattr(self.od_config, "model_stage", None) != "text_encode":
+            return
+        connector = self._encode_embed_connector()
+        if connector is None:
+            return
+        mgr = self.kv_transfer_manager
+        from_stage = str(getattr(mgr.config, "from_stage", None) or "0")
+        to_stage = str(getattr(mgr.config, "to_stage", None) or "1")
+        for req, output in zip(reqs, outputs):
+            custom = getattr(output, "custom_output", None)
+            if not isinstance(custom, dict):
+                continue
+            payload = {
+                k: custom[k]
+                for k in ("prompt_embeds", "negative_prompt_embeds")
+                if custom.get(k) is not None
+            }
+            if not payload:
+                continue
+            key = f"{req.request_id}:encode_embeds"
+            try:
+                success, size, metadata = connector.put(from_stage, to_stage, key, payload)
+            except Exception:
+                logger.exception("[encode-eg] NIXL put failed for %s", req.request_id)
+                continue
+            if success and metadata is not None:
+                custom["_encode_embed_transfer"] = {
+                    "key": key,
+                    "from_stage": from_stage,
+                    "to_stage": to_stage,
+                    "metadata": metadata,
+                }
+                logger.info(
+                    "[encode-eg] NIXL put embeds req=%s key=%s size=%d",
+                    req.request_id,
+                    key,
+                    size,
+                )
+
+    def _maybe_recv_encode_embeds(self, req: OmniDiffusionRequest) -> None:
+        """Receiver hook: pull text_encode embeddings via the connector.
+
+        Runs only on the ``dit`` stage.  If the incoming prompt carries a
+        ``_encode_embed_transfer`` handle, ``get`` the embeddings from the
+        connector and overwrite the prompt's embedding tensors.  On any failure
+        the inline embeddings (if present) remain in effect.
+        """
+        if getattr(self.od_config, "model_stage", None) != "dit":
+            return
+        prompt = getattr(req, "prompt", None)
+        if not isinstance(prompt, dict):
+            return
+        handle = prompt.get("_encode_embed_transfer")
+        if not isinstance(handle, dict):
+            return
+        connector = self._encode_embed_connector()
+        if connector is None:
+            return
+        from_stage = str(handle.get("from_stage", "0"))
+        to_stage = str(handle.get("to_stage", "1"))
+        key = handle.get("key", f"{req.request_id}:encode_embeds")
+        try:
+            result = connector.get(from_stage, to_stage, key, metadata=handle.get("metadata"))
+        except Exception:
+            logger.exception("[encode-eg] NIXL get failed for %s", getattr(req, "request_id", "?"))
+            return
+        if not result:
+            logger.warning("[encode-eg] NIXL get returned no payload for key=%s", key)
+            return
+        payload, size = result
+        if not isinstance(payload, dict):
+            logger.warning("[encode-eg] NIXL get unexpected payload %s for key=%s", type(payload), key)
+            return
+        for k in ("prompt_embeds", "negative_prompt_embeds"):
+            tensor = payload.get(k)
+            if tensor is not None:
+                prompt[k] = tensor.to(self.device) if hasattr(tensor, "to") else tensor
+        logger.info(
+            "[encode-eg] NIXL get embeds req=%s key=%s size=%d",
+            getattr(req, "request_id", "?"),
+            key,
+            size,
+        )
+
     def _prepare_request_for_forward(
         self,
         req: OmniDiffusionRequest,
@@ -331,6 +449,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_jobs: dict | None = None,
         use_prefetch: bool = False,
     ) -> None:
+        # Encode/Generation disaggregation: pull prompt embeddings over the
+        # connector before forward.
+        self._maybe_recv_encode_embeds(req)
         # Receive AR KV. Single-request execution can use the prefetch path:
         # consume prior-forward payload, sync-fallback on miss; request-batch
         # execution keeps the synchronous per-request receive path.
@@ -492,7 +613,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and od_config.enable_cache_dit_summary
             ):
                 cache_summary(self.pipeline, details=True)
-
+        # Wan EG: register text_encode embeddings for connector transfer.
+        if outputs:
+            self._maybe_send_encode_embeds(reqs, outputs)
         return self._runner_output_from_outputs(reqs, outputs)
 
     def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
