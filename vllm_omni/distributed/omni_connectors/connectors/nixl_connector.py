@@ -151,6 +151,13 @@ class NixlConnector(OmniConnectorBase):
             if not isinstance(tensor_specs, list) or not isinstance(regions, list):
                 raise RuntimeError(f"Invalid NIXL metadata for {get_key}: missing tensor_specs/regions")
 
+            # Metadata may be serialized (e.g. msgpack over ZMQ) between ``put``
+            # and ``get``, which turns the region descriptor tuples into lists.
+            # Restore tuples and strip to the 3-tuple ``(addr, len, dev)`` form
+            # that NIXL's ``get_xfer_descs`` requires; the 4th reg-desc metadata
+            # field is only valid for ``get_reg_descs`` (registration).
+            remote_xfer_regions = [tuple(region)[:3] for region in regions]
+
             local_tensors = [self._allocate_tensor_from_spec(spec, metadata.get("kind")) for spec in tensor_specs]
             local_memory_type = self._resolve_memory_type(local_tensors[0])
             local_regions = [self._tensor_region(tensor) for tensor in local_tensors]
@@ -159,8 +166,9 @@ class NixlConnector(OmniConnectorBase):
 
             remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
             self._remote_agents.append(remote_agent)
-            remote_descs = self._agent.get_xfer_descs(regions, metadata.get("memory_type", "DRAM"))
-            local_descs = self._agent.get_xfer_descs(local_regions, local_memory_type)
+            remote_descs = self._agent.get_xfer_descs(remote_xfer_regions, metadata.get("memory_type", "DRAM"))
+            local_xfer_regions = [tuple(region)[:3] for region in local_regions]
+            local_descs = self._agent.get_xfer_descs(local_xfer_regions, local_memory_type)
             remote_dlist = self._agent.prep_xfer_dlist(remote_agent, remote_descs)
             local_dlist = self._agent.prep_xfer_dlist(_INIT_AGENT, local_descs)
 
