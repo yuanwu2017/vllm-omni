@@ -52,9 +52,9 @@ class StagePayload:
     request_id: str
     boundary: StageBoundary
     scalar_fields: dict[str, object]
-    tensor_fields: dict[str, "torch.Tensor"]
+    tensor_fields: dict[str, torch.Tensor]
     private_scalar_fields: dict[str, object]
-    private_tensor_fields: dict[str, "torch.Tensor"]
+    private_tensor_fields: dict[str, torch.Tensor]
     payload_version: int = 1
 
 

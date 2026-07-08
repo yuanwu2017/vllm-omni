@@ -13,7 +13,6 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any
 
 import torch
 from torch.profiler import record_function

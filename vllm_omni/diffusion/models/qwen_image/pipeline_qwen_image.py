@@ -50,7 +50,6 @@ from vllm_omni.diffusion.utils.size_utils import (
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState
-
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -727,9 +726,7 @@ class QwenImagePipeline(
             return value.unsqueeze(0)
         if value.ndim == target_ndim:
             return value
-        raise ValueError(
-            f"Expected prompt tensor with ndim {target_ndim - 1} or {target_ndim}, got {value.ndim}."
-        )
+        raise ValueError(f"Expected prompt tensor with ndim {target_ndim - 1} or {target_ndim}, got {value.ndim}.")
 
     def _state_generation_context(self, state: DiffusionRequestState) -> dict[str, Any]:
         sampling = state.sampling

@@ -125,8 +125,8 @@ class TestWorkerUsesHook:
     @patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform")
     def test_streaming_output_uses_v2_runner_with_default_runner(self, mock_platform):
         """Streaming output needs the stepwise runner even before load_model."""
-        from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
         import vllm_omni.diffusion.worker.diffusion_worker as worker_module
+        from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
         class _SelectedRunner:
             def __init__(self, vllm_config, od_config, device):
