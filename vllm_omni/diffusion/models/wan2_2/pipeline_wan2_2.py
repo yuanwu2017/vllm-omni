@@ -19,6 +19,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -28,7 +29,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, role_loads_component
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
@@ -315,11 +316,21 @@ class Wan22Pipeline(
 
         self.boundary_ratio = od_config.boundary_ratio
 
-        # Encode-only role (Encode/Generation (EG) disaggregation): this stage
-        # runs ONLY the text encoder (UMT5) and emits prompt embeddings for a
-        # downstream diffusion stage. Skip loading the DiT transformer(s) and
-        # VAE to save memory; ``forward`` is never called on this stage.
-        self.encode_only = getattr(od_config, "model_stage", None) == "text_encode"
+        # Diffusion stage role (Encode/Generation (EG) disaggregation and
+        # beyond). ``resolve_diffusion_stage_role`` maps the structured
+        # ``stage_role`` (falling back to the legacy ``model_stage`` string) to
+        # a ``DiffusionStageRole``. ``role_loads_component`` then decides, model
+        # -agnostically, which component groups this stage instantiates so an
+        # ENCODE stage drops the DiT + VAE, etc.  ``forward`` is never called on
+        # an encode-only stage.
+        self.stage_role = resolve_diffusion_stage_role(
+            getattr(od_config, "stage_role", None),
+            getattr(od_config, "model_stage", None),
+        )
+        role = self.stage_role.value
+        self.encode_only = not role_loads_component(role, "dit")
+        load_dit = role_loads_component(role, "dit")
+        load_vae = role_loads_component(role, "vae")
 
         # Determine which transformers to load based on boundary_ratio
         # boundary_ratio=1.0: only load transformer_2 (low-noise stage only)
@@ -329,7 +340,7 @@ class Wan22Pipeline(
         load_transformer_2 = self.has_transformer_2 and (
             self.boundary_ratio != 0.0 if self.boundary_ratio is not None else True
         )
-        if self.encode_only:
+        if not load_dit:
             load_transformer = False
             load_transformer_2 = False
 
@@ -383,7 +394,7 @@ class Wan22Pipeline(
             local_files_only=local_files_only,
             torch_dtype=dtype,
         ).to(self.device)
-        if self.encode_only:
+        if not load_vae:
             self.vae = None
         else:
             self.vae = from_pretrained_with_prefetch(
@@ -559,12 +570,15 @@ class Wan22Pipeline(
     def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
         """Dispatch to the computation for this pipeline's stage role.
 
-        Centralizes Encode/Generation (EG) disaggregation dispatch so the
-        model runner stays stage-agnostic: an encode-only stage runs just the
-        text encoder, while every other stage runs the full diffusion forward
-        pass.
+        Centralizes diffusion disaggregation dispatch so the model runner stays
+        stage-agnostic: an ENCODE stage runs just the text encoder, while every
+        other role runs the full diffusion forward pass (which internally skips
+        text encoding when upstream embeddings are supplied). Additional roles
+        (e.g. a standalone DECODE stage) plug in here without runner changes.
         """
-        if self.encode_only:
+        from vllm_omni.config.stage_config import DiffusionStageRole
+
+        if self.stage_role == DiffusionStageRole.ENCODE:
             return self.encode(batch.requests[0])
         return self.forward(batch)
 

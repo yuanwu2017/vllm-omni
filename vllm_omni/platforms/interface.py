@@ -19,6 +19,7 @@ logger = init_logger(__name__)
 class OmniPlatformEnum(Enum):
     """Enum for supported Omni platforms."""
 
+    CPU = "cpu"
     CUDA = "cuda"
     ROCM = "rocm"
     NPU = "npu"
@@ -38,6 +39,9 @@ class OmniPlatform(Platform):
     """
 
     _omni_enum: OmniPlatformEnum
+
+    def is_cpu(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.CPU
 
     def is_npu(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.NPU

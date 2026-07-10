@@ -14,6 +14,7 @@ import copy
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -45,6 +46,17 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _NoopMemoryProfiler:
+    consumed_memory: int = 0
+
+    def __enter__(self) -> "_NoopMemoryProfiler":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        return None
 
 
 def _normalize_pipeline_outputs(
@@ -183,13 +195,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 return memory_pool_context_fn(tag="weights")
             return nullcontext()
 
+        def get_memory_profiler():
+            if self.device.type == "cpu":
+                return _NoopMemoryProfiler()
+            return DeviceMemoryProfiler()
+
         # Load model within forward context
         load_config = LoadConfig()
         model_loader = DiffusersPipelineLoader(load_config, od_config=self.od_config)
         time_before_load = time.perf_counter()
 
         with get_memory_context():
-            with DeviceMemoryProfiler() as m:
+            with get_memory_profiler() as m:
                 self.pipeline = model_loader.load_model(
                     load_device=load_device,
                     load_format=load_format,
@@ -324,20 +341,25 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         return peak_memory_mb
 
     # ------------------------------------------------------------------
-    # Encode/Generation (EG) disaggregation: worker-to-worker prompt-embedding
-    # transfer over the configured OmniConnector (e.g. NixlConnector/UCX)
-    # instead of inlining the embedding tensors through the orchestrator ZMQ
-    # path.  Applies to any diffusion pipeline that splits a text/prompt encode
-    # stage from the generation stage.
+    # Diffusion disaggregation: worker-to-worker payload transfer over the
+    # configured OmniConnector (e.g. NixlConnector/UCX) instead of inlining the
+    # tensors through the orchestrator ZMQ path.  The payload schema is
+    # declarative (``stage_payload_keys``), so this generalizes to any producer
+    # -> consumer edge: prompt embeddings for encode -> denoise, latents for
+    # denoise -> decode, etc.
     # ------------------------------------------------------------------
-    def _encode_embed_connector(self):
-        """Return the lazily-initialized OmniConnector for the encode edge, or None.
+    _STAGE_PAYLOAD_HANDLE_KEY = "_stage_payload_transfer"
+    # Legacy handle key kept so encode -> denoise edges built before the generic
+    # rename keep working.
+    _LEGACY_ENCODE_HANDLE_KEY = "_encode_embed_transfer"
+
+    def _stage_payload_connector(self):
+        """Return the lazily-initialized OmniConnector for the stage edge, or None.
 
         The connector is configured on the stage's ``omni_kv_config`` from the
-        YAML ``output_connectors``/``input_connectors`` edge; accessing the
-        property instantiates it on first use.  Any failure (e.g. NIXL not
-        installed) degrades to ``None`` so the caller falls back to the inline
-        embedding path.
+        ``output_connectors``/``input_connectors`` edge; accessing the property
+        instantiates it on first use.  Any failure (e.g. NIXL not installed)
+        degrades to ``None`` so the caller falls back to the inline payload path.
         """
         mgr = getattr(self, "kv_transfer_manager", None)
         if mgr is None:
@@ -345,21 +367,28 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         try:
             return mgr.connector
         except Exception:
-            logger.exception("[encode-eg] failed to initialize embedding connector")
+            logger.exception("[diffusion-disagg] failed to initialize stage connector")
             return None
 
-    def _maybe_send_encode_embeds(self, reqs: list, outputs: list) -> None:
-        """Sender hook: register text_encode embeddings for connector transfer.
+    def _stage_payload_keys(self) -> tuple[str, ...]:
+        """Declared ``custom_output`` keys this stage hands off downstream."""
+        keys = getattr(self.od_config, "stage_payload_keys", ()) or ()
+        return tuple(keys)
 
-        Runs only on the ``text_encode`` stage.  For each output carrying
-        ``prompt_embeds``, ``put`` the embedding payload into the connector and
-        stash the returned transfer handle on ``custom_output`` so the
-        downstream DiT stage can ``get`` it.  The inline embeddings are left in
-        place as a fallback.
+    def _maybe_send_stage_payload(self, reqs: list, outputs: list) -> None:
+        """Sender hook: register this stage's declared payload for transfer.
+
+        Runs on any producer stage that declares ``stage_payload_keys``.  For
+        each output carrying those keys on ``custom_output``, ``put`` the payload
+        into the connector and stash the returned transfer handle so the
+        downstream stage can ``get`` it.  The inline payload is left in place as
+        a fallback.  Consumer stages (whose forward output does not contain the
+        declared keys) naturally no-op here.
         """
-        if getattr(self.od_config, "model_stage", None) != "text_encode":
+        payload_keys = self._stage_payload_keys()
+        if not payload_keys:
             return
-        connector = self._encode_embed_connector()
+        connector = self._stage_payload_connector()
         if connector is None:
             return
         mgr = self.kv_transfer_manager
@@ -369,76 +398,79 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             custom = getattr(output, "custom_output", None)
             if not isinstance(custom, dict):
                 continue
-            payload = {
-                k: custom[k]
-                for k in ("prompt_embeds", "negative_prompt_embeds")
-                if custom.get(k) is not None
-            }
+            payload = {k: custom[k] for k in payload_keys if custom.get(k) is not None}
             if not payload:
                 continue
-            key = f"{req.request_id}:encode_embeds"
+            key = f"{req.request_id}:stage_payload"
             try:
                 success, size, metadata = connector.put(from_stage, to_stage, key, payload)
             except Exception:
-                logger.exception("[encode-eg] NIXL put failed for %s", req.request_id)
+                logger.exception("[diffusion-disagg] connector put failed for %s", req.request_id)
                 continue
             if success and metadata is not None:
-                custom["_encode_embed_transfer"] = {
+                handle = {
                     "key": key,
                     "from_stage": from_stage,
                     "to_stage": to_stage,
                     "metadata": metadata,
+                    "payload_keys": list(payload.keys()),
                 }
+                custom[self._STAGE_PAYLOAD_HANDLE_KEY] = handle
+                # Back-compat alias for encode -> denoise edges.
+                custom[self._LEGACY_ENCODE_HANDLE_KEY] = handle
                 logger.info(
-                    "[encode-eg] NIXL put embeds req=%s key=%s size=%d",
+                    "[diffusion-disagg] connector put req=%s key=%s size=%d keys=%s",
                     req.request_id,
                     key,
                     size,
+                    list(payload.keys()),
                 )
 
-    def _maybe_recv_encode_embeds(self, req: OmniDiffusionRequest) -> None:
-        """Receiver hook: pull text_encode embeddings via the connector.
+    def _maybe_recv_stage_payload(self, req: OmniDiffusionRequest) -> None:
+        """Receiver hook: pull the upstream stage payload via the connector.
 
-        Runs only on the ``dit`` stage.  If the incoming prompt carries a
-        ``_encode_embed_transfer`` handle, ``get`` the embeddings from the
-        connector and overwrite the prompt's embedding tensors.  On any failure
-        the inline embeddings (if present) remain in effect.
+        Runs whenever the incoming prompt carries a transfer handle (regardless
+        of role), ``get`` the payload from the connector and write its tensors
+        onto the prompt dict.  On any failure the inline payload (if present)
+        remains in effect.
         """
-        if getattr(self.od_config, "model_stage", None) != "dit":
-            return
         prompt = getattr(req, "prompt", None)
         if not isinstance(prompt, dict):
             return
-        handle = prompt.get("_encode_embed_transfer")
+        handle = prompt.get(self._STAGE_PAYLOAD_HANDLE_KEY) or prompt.get(self._LEGACY_ENCODE_HANDLE_KEY)
         if not isinstance(handle, dict):
             return
-        connector = self._encode_embed_connector()
+        connector = self._stage_payload_connector()
         if connector is None:
             return
         from_stage = str(handle.get("from_stage", "0"))
         to_stage = str(handle.get("to_stage", "1"))
-        key = handle.get("key", f"{req.request_id}:encode_embeds")
+        key = handle.get("key", f"{req.request_id}:stage_payload")
         try:
             result = connector.get(from_stage, to_stage, key, metadata=handle.get("metadata"))
         except Exception:
-            logger.exception("[encode-eg] NIXL get failed for %s", getattr(req, "request_id", "?"))
+            logger.exception("[diffusion-disagg] connector get failed for %s", getattr(req, "request_id", "?"))
             return
         if not result:
-            logger.warning("[encode-eg] NIXL get returned no payload for key=%s", key)
+            logger.warning("[diffusion-disagg] connector get returned no payload for key=%s", key)
             return
         payload, size = result
         if not isinstance(payload, dict):
-            logger.warning("[encode-eg] NIXL get unexpected payload %s for key=%s", type(payload), key)
+            logger.warning("[diffusion-disagg] connector get unexpected payload %s for key=%s", type(payload), key)
             return
-        for k in ("prompt_embeds", "negative_prompt_embeds"):
+        # Prefer the keys recorded on the handle; fall back to whatever the
+        # payload carries so the schema stays declarative end-to-end.
+        recv_keys = handle.get("payload_keys") or list(payload.keys())
+        for k in recv_keys:
             tensor = payload.get(k)
             if tensor is not None:
                 prompt[k] = tensor.to(self.device) if hasattr(tensor, "to") else tensor
         logger.info(
-            "[encode-eg] NIXL get embeds req=%s key=%s size=%d",
+            "[diffusion-disagg] connector get req=%s key=%s size=%d keys=%s",
             getattr(req, "request_id", "?"),
             key,
             size,
+            recv_keys,
         )
 
     def _prepare_request_for_forward(
@@ -449,9 +481,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_jobs: dict | None = None,
         use_prefetch: bool = False,
     ) -> None:
-        # Encode/Generation disaggregation: pull prompt embeddings over the
+        # Diffusion disaggregation: pull the upstream stage payload over the
         # connector before forward.
-        self._maybe_recv_encode_embeds(req)
+        self._maybe_recv_stage_payload(req)
         # Receive AR KV. Single-request execution can use the prefetch path:
         # consume prior-forward payload, sync-fallback on miss; request-batch
         # execution keeps the synchronous per-request receive path.
@@ -585,7 +617,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     # disaggregation) expose ``run_stage`` and decide internally
                     # whether to encode only or run the full forward pass.
                     run_stage = getattr(self.pipeline, "run_stage", None)
-                    if allow_single_output and callable(run_stage):
+                    if callable(run_stage):
                         raw_outputs = run_stage(batch)
                     else:
                         raw_outputs = self.pipeline.forward(batch)
@@ -613,9 +645,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and od_config.enable_cache_dit_summary
             ):
                 cache_summary(self.pipeline, details=True)
-        # Wan EG: register text_encode embeddings for connector transfer.
+        # Diffusion disaggregation: register this stage's declared payload for
+        # connector transfer to the downstream stage.
         if outputs:
-            self._maybe_send_encode_embeds(reqs, outputs)
+            self._maybe_send_stage_payload(reqs, outputs)
         return self._runner_output_from_outputs(reqs, outputs)
 
     def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:

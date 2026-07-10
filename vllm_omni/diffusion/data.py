@@ -583,6 +583,18 @@ class OmniDiffusionConfig:
     # diffusion stage (Encode/Generation (EG) disaggregation).
     model_stage: str | None = None
 
+    # Structured diffusion stage role (encode / denoise / decode / full).
+    # This supersedes the free-form ``model_stage`` string: it is the
+    # model-agnostic axis that drives role-based component loading and stage
+    # dispatch so any DiT model can be disaggregated via config. When ``None``
+    # it is derived from ``model_stage`` (see ``resolve_diffusion_stage_role``).
+    stage_role: str | None = None
+
+    # Declarative disaggregation handoff payload: the ``custom_output`` keys a
+    # producing stage should transfer to the next stage (e.g. prompt embeddings
+    # for encode->denoise, latents for denoise->decode). Empty for single-stage.
+    stage_payload_keys: tuple[str, ...] = ()
+
     dtype: torch.dtype = torch.bfloat16
 
     model_config: dict[str, Any] = field(default_factory=dict)

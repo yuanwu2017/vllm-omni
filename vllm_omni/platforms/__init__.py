@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import os
 import traceback
 from itertools import chain
 from typing import TYPE_CHECKING
@@ -131,6 +132,16 @@ builtin_omni_platform_plugins = {
 
 def resolve_current_omni_platform_cls_qualname() -> str:
     """Resolve the current OmniPlatform class qualified name."""
+    target_device = os.environ.get("VLLM_OMNI_TARGET_DEVICE") or os.environ.get(
+        "VLLM_TARGET_DEVICE"
+    )
+    if target_device is not None and target_device.lower() == "cpu":
+        import vllm.platforms as vllm_platforms
+        from vllm.platforms.cpu import CpuPlatform
+
+        vllm_platforms.current_platform = CpuPlatform()
+        return "vllm_omni.platforms.cpu.platform.CPUOmniPlatform"
+
     platform_plugins = load_omni_plugins_by_group(OMNI_PLATFORM_PLUGINS_GROUP)
 
     activated_plugins = []

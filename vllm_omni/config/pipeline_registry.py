@@ -82,6 +82,10 @@ from vllm_omni.model_executor.models.qwen3_omni.pipeline import resolve_qwen3_om
 from vllm_omni.model_executor.models.qwen3_tts.pipeline import QWEN3_TTS_PIPELINE
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
+from vllm_omni.model_executor.models.wan2_2.pipeline import (
+    WAN2_2_EG_PIPELINE,
+    WAN2_2_PIPELINE,
+)
 
 logger = init_logger(__name__)
 
@@ -126,6 +130,9 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "higgs_multimodal_qwen3": HIGGS_AUDIO_V3_PIPELINE,
     "dynin_omni": DYNIN_OMNI_PIPELINE,
     "indextts2": INDEXTTS2_PIPELINE,
+    "wan2_2": WAN2_2_PIPELINE,
+    # Disaggregated diffusion variant (opt-in): Wan Encode/Generation split.
+    "wan2_2_eg": WAN2_2_EG_PIPELINE,
 }
 
 
