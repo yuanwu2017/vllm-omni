@@ -144,6 +144,8 @@ ENV VLLM_TARGET_DEVICE=xpu
 ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip uninstall triton triton-xpu && \
+    uv pip install triton-xpu==3.7.1 && \
     uv pip install --no-cache --no-build-isolation .
 
 ARG NIXL_VERSION=v1.3.0
@@ -197,7 +199,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-cache --no-build-isolation \
     --extra-index-url https://mirrors.ustc.edu.cn/pypi/simple/ \
     ".[dev]" && \
-    uv pip uninstall oneccl oneccl-devel
+    uv pip uninstall triton oneccl oneccl-devel && \
+    uv pip install triton-xpu==3.7.1 --reinstall
 
 FROM vllm-omni AS vllm-omni-openai
 
