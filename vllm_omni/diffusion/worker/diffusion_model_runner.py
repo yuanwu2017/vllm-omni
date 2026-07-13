@@ -14,7 +14,6 @@ import copy
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -54,17 +53,6 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class _NoopMemoryProfiler:
-    consumed_memory: int = 0
-
-    def __enter__(self) -> "_NoopMemoryProfiler":
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        return None
 
 
 def _normalize_pipeline_outputs(
@@ -203,18 +191,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 return memory_pool_context_fn(tag="weights")
             return nullcontext()
 
-        def get_memory_profiler():
-            if self.device.type == "cpu":
-                return _NoopMemoryProfiler()
-            return DeviceMemoryProfiler()
-
         # Load model within forward context
         load_config = LoadConfig()
         model_loader = DiffusersPipelineLoader(load_config, od_config=self.od_config)
         time_before_load = time.perf_counter()
 
         with get_memory_context():
-            with get_memory_profiler() as m:
+            with DeviceMemoryProfiler() as m:
                 self.pipeline = model_loader.load_model(
                     load_device=load_device,
                     load_format=load_format,
@@ -517,8 +500,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if req.sampling_params.generator is None and req.sampling_params.seed is not None:
             if req.sampling_params.generator_device is not None:
                 gen_device = req.sampling_params.generator_device
-            elif self.device.type == "cpu":
-                gen_device = "cpu"
             else:
                 gen_device = self.device
             req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
@@ -781,8 +762,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 if state.sampling.generator is None and state.sampling.seed is not None:
                     if state.sampling.generator_device is not None:
                         gen_device = state.sampling.generator_device
-                    elif self.device.type == "cpu":
-                        gen_device = "cpu"
                     else:
                         gen_device = self.device
                     state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
