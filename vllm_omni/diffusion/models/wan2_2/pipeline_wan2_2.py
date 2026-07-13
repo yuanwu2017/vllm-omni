@@ -268,6 +268,8 @@ class Wan22Pipeline(
     DiffusionPipelineProfilerMixin,
     SupportsComponentDiscovery,
 ):
+    supports_request_batch = True
+
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -567,7 +569,7 @@ class Wan22Pipeline(
 
         return latents
 
-    def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput:
+    def run_stage(self, batch: DiffusionRequestBatch) -> DiffusionOutput | list[DiffusionOutput]:
         """Dispatch to the computation for this pipeline's stage role.
 
         Centralizes diffusion disaggregation dispatch so the model runner stays
@@ -579,8 +581,49 @@ class Wan22Pipeline(
         from vllm_omni.config.stage_config import DiffusionStageRole
 
         if self.stage_role == DiffusionStageRole.ENCODE:
-            return self.encode(batch.requests[0])
+            return self.encode_batch(batch)
         return self.forward(batch)
+
+    def encode_batch(self, batch: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        if batch.num_reqs == 1:
+            return [self.encode(batch.requests[0])]
+
+        prompts: list[str] = []
+        negative_prompts: list[str | None] = []
+        for req in batch.requests:
+            if req.prompt is None:
+                raise ValueError("Prompt is required for the Wan text-encode stage.")
+            prompt = req.prompt if isinstance(req.prompt, str) else req.prompt.get("prompt")
+            negative_prompt = None if isinstance(req.prompt, str) else req.prompt.get("negative_prompt")
+            if prompt is None:
+                raise ValueError("Prompt is required for the Wan text-encode stage.")
+            prompts.append(prompt)
+            negative_prompts.append(negative_prompt)
+
+        first_sampling = batch.sampling_params_list[0]
+        device = self.device
+        dtype = self.text_encoder.dtype
+        guidance_scale = first_sampling.guidance_scale or 1.0
+        guidance_scale_2 = first_sampling.guidance_scale_2
+        do_classifier_free_guidance = guidance_scale > 1.0 or (guidance_scale_2 is not None and guidance_scale_2 > 1.0)
+
+        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+            prompt=prompts,
+            negative_prompt=negative_prompts,
+            do_classifier_free_guidance=do_classifier_free_guidance,
+            num_videos_per_prompt=first_sampling.num_outputs_per_prompt or 1,
+            max_sequence_length=first_sampling.max_sequence_length or 512,
+            device=device,
+            dtype=dtype,
+        )
+
+        outputs: list[DiffusionOutput] = []
+        for idx in range(batch.num_reqs):
+            custom_output: dict[str, Any] = {"prompt_embeds": prompt_embeds[idx : idx + 1]}
+            if negative_prompt_embeds is not None:
+                custom_output["negative_prompt_embeds"] = negative_prompt_embeds[idx : idx + 1]
+            outputs.append(DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True))
+        return outputs
 
     def encode(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """Run only the text encoder and emit prompt embeddings.
@@ -625,29 +668,46 @@ class Wan22Pipeline(
         # without pinning a CUDA/XPU context on the receiver.
         return DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True)
 
-    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
-        prompt: str | None = None
-        negative_prompt: str | None = None
-        prompt_embeds: torch.Tensor | None = None
-        negative_prompt_embeds: torch.Tensor | None = None
-        if len(req.prompts) > 1:
-            raise ValueError(
-                """This model only supports a single prompt, not a batched request.""",
-                """Please pass in a single prompt object or string, or a single-item list.""",
-            )
-        if len(req.prompts) == 1:
-            first_prompt = req.prompts[0]
-            prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
-            negative_prompt = None if isinstance(first_prompt, str) else first_prompt.get("negative_prompt")
+    def forward(
+        self,
+        req: DiffusionRequestBatch,
+        prompt: str | None = None,
+        negative_prompt: str | None = None,
+        height: int = 480,
+        width: int = 832,
+        num_inference_steps: int = 40,
+        guidance_scale: float | tuple[float, float] = 4.0,
+        frame_num: int = 81,
+        output_type: str | None = "np",
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        attention_kwargs: dict | None = None,
+        **kwargs,
+    ) -> DiffusionOutput | list[DiffusionOutput]:
+        sampling_params = req.sampling_params_list[0]
+        num_outputs_per_prompt = sampling_params.num_outputs_per_prompt or 1
+        if len(req.prompts) >= 1:
+            prompt_values = [p if isinstance(p, str) else p.get("prompt") for p in req.prompts]
+            negative_prompt_values = [None if isinstance(p, str) else p.get("negative_prompt") for p in req.prompts]
+            prompt = prompt_values[0] if len(prompt_values) == 1 else cast(list[str], prompt_values)
+            negative_prompt = negative_prompt_values[0] if len(negative_prompt_values) == 1 else negative_prompt_values
             # Encode/Generation (EG) disaggregation: a precomputed text-encoder
             # output may arrive in the prompt dict (emitted by an upstream
             # ``text_encode`` stage). When present it takes precedence over the
-            # raw text and bypasses ``encode_prompt`` below.
-            if not isinstance(first_prompt, str):
-                if prompt_embeds is None and first_prompt.get("prompt_embeds") is not None:
-                    prompt_embeds = first_prompt.get("prompt_embeds")
-                if negative_prompt_embeds is None and first_prompt.get("negative_prompt_embeds") is not None:
-                    negative_prompt_embeds = first_prompt.get("negative_prompt_embeds")
+            # kwargs and bypasses ``encode_prompt`` below.
+            if prompt_embeds is None:
+                prompt_embeds = DiffusionRequestBatch.collate_tensors(
+                    [DiffusionRequestBatch.get_prompt_field(p, "prompt_embeds") for p in req.prompts],
+                    "prompt_embeds",
+                    None,
+                )
+            if negative_prompt_embeds is None:
+                negative_prompt_embeds = DiffusionRequestBatch.collate_tensors(
+                    [DiffusionRequestBatch.get_prompt_field(p, "negative_prompt_embeds") for p in req.prompts],
+                    "negative_prompt_embeds",
+                    None,
+                )
             # ``check_inputs`` (diffusers semantics) forbids passing both the
             # raw text and its precomputed embedding. When embeddings are
             # supplied they take precedence, so drop the raw prompt text.
@@ -655,13 +715,15 @@ class Wan22Pipeline(
                 prompt = None
             if negative_prompt_embeds is not None:
                 negative_prompt = None
+            if prompt is not None and any(value is None for value in prompt_values):
+                raise ValueError("Prompt is required for each Wan2.2 batch request unless prompt_embeds are supplied.")
 
-        if not prompt and prompt_embeds is None:
+        if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
-        height = req.sampling_params.height or 480
-        width = req.sampling_params.width or 832
-        num_frames = req.sampling_params.num_frames or 81
+        height = sampling_params.height or height
+        width = sampling_params.width or width
+        num_frames = sampling_params.num_frames if sampling_params.num_frames else frame_num
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
@@ -669,21 +731,16 @@ class Wan22Pipeline(
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = 40 if req.sampling_params.num_inference_steps is None else req.sampling_params.num_inference_steps
+        num_steps = sampling_params.num_inference_steps or num_inference_steps
 
         # Respect per-request guidance_scale when explicitly provided.
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
-        else:
-            guidance_scale = 4.0
-
-        output_type = req.sampling_params.output_type or "np"
-        attention_kwargs: dict | None = None
+        if sampling_params.guidance_scale_provided:
+            guidance_scale = sampling_params.guidance_scale
 
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
         guidance_high = (
-            req.sampling_params.guidance_scale_2
-            if req.sampling_params.guidance_scale_2 is not None
+            sampling_params.guidance_scale_2
+            if sampling_params.guidance_scale_2 is not None
             else (
                 guidance_scale[1]
                 if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1
@@ -696,7 +753,7 @@ class Wan22Pipeline(
         self._guidance_scale_2 = guidance_high
 
         # Prefer engine-configured boundary_ratio, but allow per-request fallback.
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
+        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else sampling_params.boundary_ratio
 
         if boundary_ratio is None:
             boundary_ratio = 0.875
@@ -729,34 +786,49 @@ class Wan22Pipeline(
             dtype = self.text_encoder.dtype
 
         # Seed / generator
-        generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
+        if generator is None:
+            generator = req.collate_request_generators(num_outputs_per_prompt, sampling_params.generator)
+        if generator is None:
+            seeds = [sampling.seed for sampling in req.sampling_params_list]
+            if any(seed is not None for seed in seeds):
+                if not all(seed is not None for seed in seeds):
+                    raise ValueError("Cannot batch Wan requests with a mix of provided and missing seeds.")
+                generator = [
+                    torch.Generator(device=device).manual_seed(cast(int, sampling.seed))
+                    for sampling in req.sampling_params_list
+                    for _ in range(sampling.num_outputs_per_prompt or 1)
+                ]
 
         if DEBUG_PERF:
             # Sync GPU before timing to ensure accurate measurements
             current_omni_platform.synchronize()
             _t_pipeline_start = time.perf_counter()
             _t_text_enc_start = _t_pipeline_start
-        # Encode/Generation (EG) disaggregation: skip text encoding when an
-        # upstream ``text_encode`` stage already supplied prompt embeddings.
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                num_videos_per_prompt=num_outputs_per_prompt,
+                max_sequence_length=sampling_params.max_sequence_length or 512,
                 device=device,
                 dtype=dtype,
             )
+        else:
+            prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+            if negative_prompt_embeds is not None:
+                negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
+            elif guidance_low > 1.0 or guidance_high > 1.0:
+                raise ValueError(
+                    "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
+                )
 
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
-        sample_solver = resolve_wan_sample_solver(req, default=self._sample_solver)
-        flow_shift = resolve_wan_flow_shift(req, self.od_config)
+        sample_solver = resolve_wan_sample_solver(req.requests[0], default=self._sample_solver)
+        flow_shift = resolve_wan_flow_shift(req.requests[0], self.od_config)
         if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
             self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
             self._sample_solver = sample_solver
@@ -772,6 +844,8 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()
+        if req.num_reqs > 1 and any(not isinstance(p, str) and p.get("multi_modal_data") for p in req.prompts):
+            raise ValueError("Batched Wan requests with multi_modal_data are not supported yet.")
         multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
         if isinstance(raw_image, list):
@@ -818,7 +892,7 @@ class Wan22Pipeline(
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.sampling_params.latents,
+                latents=req.collate_request_tensors("latents", sampling_params.latents),
             )
 
             # Encode image condition
@@ -860,7 +934,7 @@ class Wan22Pipeline(
                 dtype=torch.float32,
                 device=device,
                 generator=generator,
-                latents=req.sampling_params.latents,
+                latents=req.collate_request_tensors("latents", sampling_params.latents),
             )
         if DEBUG_PERF:
             current_omni_platform.synchronize()
@@ -937,9 +1011,14 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
-        return DiffusionOutput(
-            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
-        )
+        stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        return [
+            DiffusionOutput(
+                output=output[idx * num_outputs_per_prompt : (idx + 1) * num_outputs_per_prompt],
+                stage_durations=stage_durations,
+            )
+            for idx in range(req.num_reqs)
+        ]
 
     def predict_noise(
         self,
@@ -1005,6 +1084,7 @@ class Wan22Pipeline(
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt = [p or "" for p in negative_prompt]
             neg_text_inputs = self.tokenizer(
                 [self._prompt_clean(p) for p in negative_prompt],
                 padding="max_length",
