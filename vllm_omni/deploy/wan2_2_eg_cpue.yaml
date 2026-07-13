@@ -1,0 +1,20 @@
+# CPU-E + XPU-G variant of wan2_2_eg.yaml.
+#
+# Overlays the base EG deploy config and only changes device placement:
+#   Stage 0 (encode):  runs the UMT5 text encoder on CPU.
+#   Stage 1 (denoise): runs DiT/VAE on the single XPU visible inside each
+#                      headless decode container (ordinal 0 after
+#                      ZE_AFFINITY_MASK narrows it to one physical card).
+#
+# Everything else (pipeline, connectors, batch sizes, sampling) is inherited
+# from the base via ``base_config``.
+#
+# Select with: --deploy-config vllm_omni/deploy/wan2_2_eg_cpue.yaml
+
+base_config: wan2_2_eg.yaml
+
+stages:
+  - stage_id: 0
+    devices: cpu
+  - stage_id: 1
+    devices: "0"

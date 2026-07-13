@@ -17,6 +17,10 @@ generic cross-stage handoff processor
 ``vllm_omni.model_executor.stage_input_processors.diffusion_disagg.diffusion_stage_handoff``,
 so the same machinery generalizes to other DiT models and to a 3-way
 Encode/Generation/Decode (EGD) split.
+
+Runtime knobs (device placement, connectors, batch sizes) live in the new
+deploy configs ``vllm_omni/deploy/wan2_2_eg.yaml`` (and the CPU-encode variant
+``wan2_2_eg_cpue.yaml``); select them with ``--deploy-config``.
 """
 
 from vllm_omni.config.stage_config import (
