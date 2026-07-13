@@ -9,8 +9,8 @@ encoder, or a ``denoise`` stage emitting latents) surfaces its payload on
 transfer handle, if any — into the consuming stage's prompt dict so the
 downstream stage skips the work the upstream stage already did.
 
-Unlike the earlier Wan-specific ``wan_encode.encode2diffusion``, this processor
-is model-agnostic: it forwards *whatever* keys the upstream stage published on
+This processor is model-agnostic: it forwards *whatever* keys the upstream
+stage published on
 ``custom_output`` (prompt embeddings, negative embeddings, latents, conditioning
 tensors, ...) together with the diffusion sampling/control fields, so any DiT
 model can be disaggregated by declaring stage roles in config rather than
