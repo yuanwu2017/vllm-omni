@@ -2439,7 +2439,6 @@ class HunyuanImage3Pipeline(
         if output_type == "latent":
             state.extra["decoded_output"] = DiffusionOutput(
                 output=latents,
-                custom_output={},
                 stage_durations=getattr(self, "stage_durations", None),
             )
             return state
@@ -2463,12 +2462,14 @@ class HunyuanImage3Pipeline(
         )
 
         cot_text_list = state.extra.get(_STEP_COT_TEXT_LIST) or []
-        custom_output = {}
+        metadata = {}
         if any(text is not None for text in cot_text_list):
-            custom_output["ar_generated_text"] = cot_text_list[0]
+            metadata["text"] = {"ar_generated_text": cot_text_list[0]}
         state.extra["decoded_output"] = DiffusionOutput(
-            output=image[0],
-            custom_output=custom_output,
+            output={
+                "payload": {"image": image[0]},
+                "metadata": metadata,
+            },
             stage_durations=getattr(self, "stage_durations", None),
         )
         return state

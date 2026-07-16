@@ -324,6 +324,139 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         )
         return peak_memory_mb
 
+    # ------------------------------------------------------------------
+    # Diffusion disaggregation: worker-to-worker payload transfer over the
+    # configured OmniConnector (e.g. NixlConnector/UCX) instead of inlining the
+    # tensors through the orchestrator ZMQ path.  The payload schema is
+    # declarative (``stage_payload_keys``), so this generalizes to any producer
+    # -> consumer edge: prompt embeddings for encode -> denoise, latents for
+    # denoise -> decode, etc.
+    # ------------------------------------------------------------------
+    _STAGE_PAYLOAD_HANDLE_KEY = "_stage_payload_transfer"
+    # Legacy handle key kept so encode -> denoise edges built before the generic
+    # rename keep working.
+    _LEGACY_ENCODE_HANDLE_KEY = "_encode_embed_transfer"
+
+    def _stage_payload_connector(self):
+        """Return the lazily-initialized OmniConnector for the stage edge, or None.
+
+        The connector is configured on the stage's ``omni_kv_config`` from the
+        ``output_connectors``/``input_connectors`` edge; accessing the property
+        instantiates it on first use.  Any failure (e.g. NIXL not installed)
+        degrades to ``None`` so the caller falls back to the inline payload path.
+        """
+        mgr = getattr(self, "kv_transfer_manager", None)
+        if mgr is None:
+            return None
+        try:
+            return mgr.connector
+        except Exception:
+            logger.exception("[diffusion-disagg] failed to initialize stage connector")
+            return None
+
+    def _stage_payload_keys(self) -> tuple[str, ...]:
+        """Declared ``custom_output`` keys this stage hands off downstream."""
+        keys = getattr(self.od_config, "stage_payload_keys", ()) or ()
+        return tuple(keys)
+
+    def _maybe_send_stage_payload(self, reqs: list, outputs: list) -> None:
+        """Sender hook: register this stage's declared payload for transfer.
+
+        Runs on any producer stage that declares ``stage_payload_keys``.  For
+        each output carrying those keys on ``custom_output``, ``put`` the payload
+        into the connector and stash the returned transfer handle so the
+        downstream stage can ``get`` it.  The inline payload is left in place as
+        a fallback.  Consumer stages (whose forward output does not contain the
+        declared keys) naturally no-op here.
+        """
+        payload_keys = self._stage_payload_keys()
+        if not payload_keys:
+            return
+        connector = self._stage_payload_connector()
+        if connector is None:
+            return
+        mgr = self.kv_transfer_manager
+        from_stage = str(getattr(mgr.config, "from_stage", None) or "0")
+        to_stage = str(getattr(mgr.config, "to_stage", None) or "1")
+        for req, output in zip(reqs, outputs):
+            custom = getattr(output, "custom_output", None)
+            if not isinstance(custom, dict):
+                continue
+            payload = {k: custom[k] for k in payload_keys if custom.get(k) is not None}
+            if not payload:
+                continue
+            key = f"{req.request_id}:stage_payload"
+            try:
+                success, size, metadata = connector.put(from_stage, to_stage, key, payload)
+            except Exception:
+                logger.exception("[diffusion-disagg] connector put failed for %s", req.request_id)
+                continue
+            if success and metadata is not None:
+                handle = {
+                    "key": key,
+                    "from_stage": from_stage,
+                    "to_stage": to_stage,
+                    "metadata": metadata,
+                    "payload_keys": list(payload.keys()),
+                }
+                custom[self._STAGE_PAYLOAD_HANDLE_KEY] = handle
+                # Back-compat alias for encode -> denoise edges.
+                custom[self._LEGACY_ENCODE_HANDLE_KEY] = handle
+                logger.info(
+                    "[diffusion-disagg] connector put req=%s key=%s size=%d keys=%s",
+                    req.request_id,
+                    key,
+                    size,
+                    list(payload.keys()),
+                )
+
+    def _maybe_recv_stage_payload(self, req: OmniDiffusionRequest) -> None:
+        """Receiver hook: pull the upstream stage payload via the connector.
+
+        Runs whenever the incoming prompt carries a transfer handle (regardless
+        of role), ``get`` the payload from the connector and write its tensors
+        onto the prompt dict.  On any failure the inline payload (if present)
+        remains in effect.
+        """
+        prompt = getattr(req, "prompt", None)
+        if not isinstance(prompt, dict):
+            return
+        handle = prompt.get(self._STAGE_PAYLOAD_HANDLE_KEY) or prompt.get(self._LEGACY_ENCODE_HANDLE_KEY)
+        if not isinstance(handle, dict):
+            return
+        connector = self._stage_payload_connector()
+        if connector is None:
+            return
+        from_stage = str(handle.get("from_stage", "0"))
+        to_stage = str(handle.get("to_stage", "1"))
+        key = handle.get("key", f"{req.request_id}:stage_payload")
+        try:
+            result = connector.get(from_stage, to_stage, key, metadata=handle.get("metadata"))
+        except Exception:
+            logger.exception("[diffusion-disagg] connector get failed for %s", getattr(req, "request_id", "?"))
+            return
+        if not result:
+            logger.warning("[diffusion-disagg] connector get returned no payload for key=%s", key)
+            return
+        payload, size = result
+        if not isinstance(payload, dict):
+            logger.warning("[diffusion-disagg] connector get unexpected payload %s for key=%s", type(payload), key)
+            return
+        # Prefer the keys recorded on the handle; fall back to whatever the
+        # payload carries so the schema stays declarative end-to-end.
+        recv_keys = handle.get("payload_keys") or list(payload.keys())
+        for k in recv_keys:
+            tensor = payload.get(k)
+            if tensor is not None:
+                prompt[k] = tensor.to(self.device) if hasattr(tensor, "to") else tensor
+        logger.info(
+            "[diffusion-disagg] connector get req=%s key=%s size=%d keys=%s",
+            getattr(req, "request_id", "?"),
+            key,
+            size,
+            recv_keys,
+        )
+
     def _prepare_request_for_forward(
         self,
         req: OmniDiffusionRequest,
@@ -332,6 +465,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         kv_prefetch_jobs: dict | None = None,
         use_prefetch: bool = False,
     ) -> None:
+        # Diffusion disaggregation: pull the upstream stage payload over the
+        # connector before forward.
+        self._maybe_recv_stage_payload(req)
         # Receive AR KV. Single-request execution can use the prefetch path:
         # consume prior-forward payload, synchronously receive on miss; request-batch
         # execution keeps the synchronous per-request receive path.
@@ -357,8 +493,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         if req.sampling_params.generator is None and req.sampling_params.seed is not None:
             if req.sampling_params.generator_device is not None:
                 gen_device = req.sampling_params.generator_device
-            elif self.device.type == "cpu":
-                gen_device = "cpu"
             else:
                 gen_device = self.device
             req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
@@ -460,7 +594,15 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=od_config):
                 with record_function(record_name):
-                    raw_outputs = self.pipeline.forward(batch)
+                    # Stage dispatch is owned by the pipeline: pipelines that
+                    # support per-stage roles (e.g. Encode/Generation (EG)
+                    # disaggregation) expose ``run_stage`` and decide internally
+                    # whether to encode only or run the full forward pass.
+                    run_stage = getattr(self.pipeline, "run_stage", None)
+                    if callable(run_stage):
+                        raw_outputs = run_stage(batch)
+                    else:
+                        raw_outputs = self.pipeline.forward(batch)
                     outputs = _normalize_pipeline_outputs(
                         raw_outputs,
                         expected_count=len(reqs),
@@ -485,7 +627,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 and od_config.enable_cache_dit_summary
             ):
                 cache_summary(self.pipeline, details=True)
-
+        # Diffusion disaggregation: register this stage's declared payload for
+        # connector transfer to the downstream stage.
+        if outputs:
+            self._maybe_send_stage_payload(reqs, outputs)
         return self._runner_output_from_outputs(reqs, outputs)
 
     def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
