@@ -1224,6 +1224,9 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    # Internal non-final-stage payload consumed by StagePool. Public media
+    # outputs use the structured ``output`` payload/metadata envelope instead.
+    custom_output: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
@@ -1270,6 +1273,7 @@ class DiffusionOutput:
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        self.custom_output = _maybe_to_cpu(self.custom_output)
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":

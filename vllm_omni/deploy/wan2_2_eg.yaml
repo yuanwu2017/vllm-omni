@@ -24,6 +24,7 @@ connectors:
     name: NixlConnector
     extra:
       backends: [UCX]
+      receive_device: xpu
       lease_seconds: 300
       transfer_timeout_s: 300
 
@@ -33,6 +34,7 @@ stages:
   - stage_id: 0
     devices: "0"
     max_num_seqs: 1
+    step_execution: true
     enforce_eager: true
     tensor_parallel_size: 1
     output_connectors:
@@ -44,6 +46,7 @@ stages:
   - stage_id: 1
     devices: "1"
     max_num_seqs: 1
+    step_execution: true
     enforce_eager: true
     tensor_parallel_size: 1
     vae_use_tiling: true

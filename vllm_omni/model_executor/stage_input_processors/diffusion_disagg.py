@@ -27,6 +27,7 @@ logger = init_logger(__name__)
 
 # Diffusion sampling/control fields worth forwarding verbatim to the next stage.
 _PASSTHROUGH_KEYS: tuple[str, ...] = (
+    "multi_modal_data",
     "negative_prompt",
     "height",
     "width",

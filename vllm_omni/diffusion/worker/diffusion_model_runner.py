@@ -30,7 +30,7 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import supports_step_execution
+from vllm_omni.diffusion.models.interface import StageBoundary, StagePayload, supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -336,6 +336,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     # Legacy handle key kept so encode -> denoise edges built before the generic
     # rename keep working.
     _LEGACY_ENCODE_HANDLE_KEY = "_encode_embed_transfer"
+    _TYPED_STAGE_PAYLOAD_KEY = "stage_payload"
 
     def _stage_payload_connector(self):
         """Return the lazily-initialized OmniConnector for the stage edge, or None.
@@ -358,6 +359,141 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         """Declared ``custom_output`` keys this stage hands off downstream."""
         keys = getattr(self.od_config, "stage_payload_keys", ()) or ()
         return tuple(keys)
+
+    @staticmethod
+    def _stage_payload_to_wire(payload: StagePayload) -> dict[str, object]:
+        return {
+            "request_id": payload.request_id,
+            "boundary": payload.boundary.value,
+            "payload_version": payload.payload_version,
+            "scalar_fields": payload.scalar_fields,
+            "tensor_fields": payload.tensor_fields,
+            "private_scalar_fields": payload.private_scalar_fields,
+            "private_tensor_fields": payload.private_tensor_fields,
+        }
+
+    @staticmethod
+    def _stage_payload_from_wire(data: object) -> StagePayload:
+        if not isinstance(data, dict):
+            raise TypeError(f"Stage payload wire data must be a dict, got {type(data).__name__}.")
+        try:
+            boundary = StageBoundary(data["boundary"])
+            return StagePayload(
+                request_id=str(data["request_id"]),
+                boundary=boundary,
+                scalar_fields=dict(data.get("scalar_fields", {})),
+                tensor_fields=dict(data.get("tensor_fields", {})),
+                private_scalar_fields=dict(data.get("private_scalar_fields", {})),
+                private_tensor_fields=dict(data.get("private_tensor_fields", {})),
+                payload_version=int(data.get("payload_version", 1)),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Invalid StagePayload wire data.") from exc
+
+    def _send_typed_stage_payload(self, payload: StagePayload) -> dict[str, object]:
+        wire_payload = self._stage_payload_to_wire(payload)
+        custom_output: dict[str, object] = {}
+        connector = self._stage_payload_connector()
+        if connector is None:
+            custom_output[self._TYPED_STAGE_PAYLOAD_KEY] = wire_payload
+            return custom_output
+
+        mgr = self.kv_transfer_manager
+        from_stage = str(getattr(mgr.config, "from_stage", None) or "0")
+        to_stage = str(getattr(mgr.config, "to_stage", None) or "1")
+        key = f"{payload.request_id}:{payload.boundary.value}"
+        tensor_names = list(payload.tensor_fields)
+        private_tensor_names = list(payload.private_tensor_fields)
+        tensors = [payload.tensor_fields[name] for name in tensor_names]
+        tensors.extend(payload.private_tensor_fields[name] for name in private_tensor_names)
+        if not tensors:
+            custom_output[self._TYPED_STAGE_PAYLOAD_KEY] = wire_payload
+            return custom_output
+        try:
+            success, size, metadata = connector.put(from_stage, to_stage, key, tensors)
+        except Exception:
+            logger.exception("[diffusion-disagg] typed connector put failed for %s", payload.request_id)
+            success, size, metadata = False, 0, None
+        if not success or metadata is None:
+            custom_output[self._TYPED_STAGE_PAYLOAD_KEY] = wire_payload
+            return custom_output
+
+        custom_output[self._STAGE_PAYLOAD_HANDLE_KEY] = {
+            "key": key,
+            "from_stage": from_stage,
+            "to_stage": to_stage,
+            "metadata": metadata,
+            "boundary": payload.boundary.value,
+            "payload_version": payload.payload_version,
+            "request_id": payload.request_id,
+            "scalar_fields": payload.scalar_fields,
+            "private_scalar_fields": payload.private_scalar_fields,
+            "tensor_names": tensor_names,
+            "private_tensor_names": private_tensor_names,
+        }
+        logger.info(
+            "[diffusion-disagg] typed connector put req=%s key=%s size=%d boundary=%s",
+            payload.request_id,
+            key,
+            size,
+            payload.boundary.value,
+        )
+        return custom_output
+
+    def _recv_typed_stage_payload(self, request_id: str, prompt: object) -> StagePayload | None:
+        if not isinstance(prompt, dict):
+            return None
+        wire_payload = prompt.get(self._TYPED_STAGE_PAYLOAD_KEY)
+        handle = prompt.get(self._STAGE_PAYLOAD_HANDLE_KEY)
+        if isinstance(handle, dict):
+            connector = self._stage_payload_connector()
+            if connector is not None:
+                from_stage = str(handle.get("from_stage", "0"))
+                to_stage = str(handle.get("to_stage", "1"))
+                key = str(handle.get("key", f"{request_id}:stage_payload"))
+                try:
+                    result = connector.get(from_stage, to_stage, key, metadata=handle.get("metadata"))
+                except Exception:
+                    logger.exception("[diffusion-disagg] typed connector get failed for %s", request_id)
+                    result = None
+                if result:
+                    received_tensors, size = result
+                    if not isinstance(received_tensors, list):
+                        received_tensors = [received_tensors]
+                    tensor_names = list(handle.get("tensor_names", ()))
+                    private_tensor_names = list(handle.get("private_tensor_names", ()))
+                    expected_count = len(tensor_names) + len(private_tensor_names)
+                    if len(received_tensors) != expected_count:
+                        raise ValueError(
+                            f"Received {len(received_tensors)} stage tensors for {request_id}, "
+                            f"expected {expected_count}."
+                        )
+                    split_index = len(tensor_names)
+                    wire_payload = {
+                        "request_id": handle.get("request_id", request_id),
+                        "boundary": handle.get("boundary"),
+                        "payload_version": handle.get("payload_version", 1),
+                        "scalar_fields": handle.get("scalar_fields", {}),
+                        "private_scalar_fields": handle.get("private_scalar_fields", {}),
+                        "tensor_fields": dict(zip(tensor_names, received_tensors[:split_index])),
+                        "private_tensor_fields": dict(zip(private_tensor_names, received_tensors[split_index:])),
+                    }
+                    logger.info(
+                        "[diffusion-disagg] typed connector get req=%s key=%s size=%d",
+                        request_id,
+                        key,
+                        size,
+                    )
+        if wire_payload is None:
+            return None
+        payload = self._stage_payload_from_wire(wire_payload)
+        if payload.request_id != request_id:
+            raise ValueError(f"Received StagePayload for request {payload.request_id!r}, expected {request_id!r}.")
+        for fields in (payload.tensor_fields, payload.private_tensor_fields):
+            for name, tensor in list(fields.items()):
+                if hasattr(tensor, "to"):
+                    fields[name] = tensor.to(self.device)
+        return payload
 
     def _maybe_send_stage_payload(self, reqs: list, outputs: list) -> None:
         """Sender hook: register this stage's declared payload for transfer.

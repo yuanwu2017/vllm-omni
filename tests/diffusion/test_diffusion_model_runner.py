@@ -11,11 +11,12 @@ import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 import vllm_omni.diffusion.worker.diffusion_model_runner_v2 as model_runner_v2_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.models.interface import StagePayload
+from vllm_omni.diffusion.models.interface import StageBoundary, StagePayload
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_model_runner_v2 import DiffusionModelRunnerV2
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch, split_diffusion_output_by_request
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -188,6 +189,165 @@ class _StepRunnerConfig:
 class _NoopKVTransferManager:
     def receive_multi_kv_cache_distributed(self, req, cfg_kv_collect_func=None, target_device=None):
         del req, cfg_kv_collect_func, target_device
+
+
+class _FakeStageConnector:
+    def __init__(self):
+        self.data = None
+
+    def put(self, from_stage, to_stage, key, data):
+        del from_stage, to_stage, key
+        assert isinstance(data, list)
+        assert all(isinstance(tensor, torch.Tensor) for tensor in data)
+        self.data = data
+        return True, sum(tensor.numel() * tensor.element_size() for tensor in data), {"fake": True}
+
+    def get(self, from_stage, to_stage, key, metadata=None):
+        del from_stage, to_stage, key, metadata
+        return self.data, sum(tensor.numel() * tensor.element_size() for tensor in self.data)
+
+
+class _EncodeOnlyPipeline(_ChunkStepPipeline):
+    def __init__(self):
+        super().__init__([])
+        self.encode_calls = 0
+
+    def encode(self, state):
+        self.encode_calls += 1
+        state.prompt_embeds = torch.ones(1, 2, 3)
+        return state
+
+    def pack_stage_state(self, state, boundary):
+        return StagePayload(
+            request_id=state.request_id,
+            boundary=boundary,
+            scalar_fields={},
+            tensor_fields={"prompt_embeds": state.prompt_embeds},
+            private_scalar_fields={},
+            private_tensor_fields={},
+        )
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_typed_stage_payload_wire_round_trip():
+    payload = StagePayload(
+        request_id="req-wire",
+        boundary=StageBoundary.ENCODE_TO_DIT,
+        scalar_fields={"do_true_cfg": True},
+        tensor_fields={"prompt_embeds": torch.ones(1, 2, 3)},
+        private_scalar_fields={"output_type": "latent"},
+        private_tensor_fields={"mask": torch.zeros(1)},
+    )
+
+    wire = DiffusionModelRunner._stage_payload_to_wire(payload)
+    restored = DiffusionModelRunner._stage_payload_from_wire(wire)
+
+    assert restored.request_id == payload.request_id
+    assert restored.boundary == StageBoundary.ENCODE_TO_DIT
+    assert restored.payload_version == 1
+    assert restored.scalar_fields == {"do_true_cfg": True}
+    assert torch.equal(restored.tensor_fields["prompt_embeds"], payload.tensor_fields["prompt_embeds"])
+    assert torch.equal(restored.private_tensor_fields["mask"], payload.private_tensor_fields["mask"])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_typed_stage_payload_connector_round_trip_uses_tensor_list():
+    connector = _FakeStageConnector()
+    runner = object.__new__(DiffusionModelRunner)
+    runner.device = torch.device("cpu")
+    runner.kv_transfer_manager = SimpleNamespace(
+        connector=connector,
+        config=SimpleNamespace(from_stage="0", to_stage="1"),
+    )
+    payload = StagePayload(
+        request_id="req-nixl",
+        boundary=StageBoundary.ENCODE_TO_DIT,
+        scalar_fields={"do_true_cfg": True},
+        tensor_fields={"prompt_embeds": torch.ones(1, 2, 3)},
+        private_scalar_fields={"output_type": "latent"},
+        private_tensor_fields={"mask": torch.zeros(1)},
+    )
+
+    custom_output = runner._send_typed_stage_payload(payload)
+    restored = runner._recv_typed_stage_payload(payload.request_id, custom_output)
+
+    assert restored is not None
+    assert restored.boundary == StageBoundary.ENCODE_TO_DIT
+    assert restored.scalar_fields == payload.scalar_fields
+    assert restored.private_scalar_fields == payload.private_scalar_fields
+    assert torch.equal(restored.tensor_fields["prompt_embeds"], payload.tensor_fields["prompt_embeds"])
+    assert torch.equal(restored.private_tensor_fields["mask"], payload.private_tensor_fields["mask"])
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_runner_v2_encode_only_stage_packs_without_prepare():
+    runner = object.__new__(DiffusionModelRunnerV2)
+    runner.device = torch.device("cpu")
+    runner.pipeline = _EncodeOnlyPipeline()
+    runner.state_cache = {}
+    runner.kv_transfer_manager = SimpleNamespace(connector=None)
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=2)
+    state = DiffusionRequestState(request_id="req-encode", sampling=sampling, prompt="hello")
+    runner.state_cache[state.request_id] = state
+
+    result = runner._run_encode_only_stage([state], [state.request_id])
+    output = result.get_request_output(state.request_id)
+
+    assert output is not None
+    assert output.finished
+    assert output.result is not None
+    assert "stage_payload" in output.result.custom_output
+    assert runner.pipeline.encode_calls == 1
+    assert runner.pipeline.prepare_calls == 0
+    assert state.request_id not in runner.state_cache
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_runner_v2_denoise_stage_requires_encode_payload():
+    runner = object.__new__(DiffusionModelRunnerV2)
+    runner.device = torch.device("cpu")
+    runner.pipeline = _ChunkStepPipeline([])
+    runner.state_cache = {}
+    runner.od_config = SimpleNamespace(stage_role="denoise", model_stage="dit")
+    runner._recv_typed_stage_payload = lambda request_id, prompt: None
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=2)
+    state = DiffusionRequestState(request_id="req-denoise", sampling=sampling, prompt={})
+
+    with pytest.raises(ValueError, match="requires an ENCODE_TO_DIT payload"):
+        runner._prepare_batch_inputs([state], [state.request_id])
+
+    assert runner.pipeline.prepare_calls == 0
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_diffusion_output_moves_custom_output_tensors_to_cpu():
+    class TrackingTensor(torch.Tensor):
+        cpu_called = False
+
+        @staticmethod
+        def __new__(cls):
+            return torch.Tensor._make_subclass(cls, torch.ones(1), False)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            type(self).cpu_called = True
+            return torch.ones(1)
+
+    output = DiffusionOutput(
+        custom_output={"stage_payload": {"tensor_fields": {"prompt_embeds": TrackingTensor()}}},
+        to_cpu=True,
+    )
+
+    prompt_embeds = output.custom_output["stage_payload"]["tensor_fields"]["prompt_embeds"]
+    assert TrackingTensor.cpu_called
+    assert prompt_embeds.device.type == "cpu"
 
 
 def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summary: bool = True):

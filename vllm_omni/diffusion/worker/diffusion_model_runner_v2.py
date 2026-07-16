@@ -10,9 +10,10 @@ from dataclasses import dataclass
 import torch
 from torch.profiler import record_function
 
+from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.models.interface import StagePayload, supports_step_execution
+from vllm_omni.diffusion.models.interface import StageBoundary, StagePayload, supports_step_execution
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -45,6 +46,12 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
 
     def supports_step_mode(self) -> bool:
         return self.pipeline is not None and supports_step_execution(self.pipeline)
+
+    def _stage_role(self) -> DiffusionStageRole:
+        return resolve_diffusion_stage_role(
+            getattr(self.od_config, "stage_role", None),
+            getattr(self.od_config, "model_stage", None),
+        )
 
     def run_encode_stage(
         self,
@@ -123,11 +130,22 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
         state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
 
     def _prepare_batch_inputs(self, states: list[DiffusionRequestState], new_request_ids: list[str]) -> InputBatch:
+        stage_role = self._stage_role()
         for state_index, state in enumerate(states):
             if state.request_id not in new_request_ids:
                 continue
             self._prepare_generator(state)
-            prepared_state = self.run_encode_stage(state)
+            payload = None
+            if stage_role == DiffusionStageRole.DENOISE:
+                payload = self._recv_typed_stage_payload(state.request_id, state.prompt)
+                if payload is None:
+                    raise ValueError(f"Denoise stage requires an ENCODE_TO_DIT payload for request {state.request_id}.")
+                if payload.boundary != StageBoundary.ENCODE_TO_DIT:
+                    raise ValueError(
+                        f"Denoise stage received {payload.boundary.value!r} for request "
+                        f"{state.request_id}; expected {StageBoundary.ENCODE_TO_DIT.value!r}."
+                    )
+            prepared_state = self.run_encode_stage(state, payload=payload)
             if prepared_state.request_id != state.request_id:
                 raise ValueError("Pipeline atom changed request_id during encode stage.")
             states[state_index] = prepared_state
@@ -139,6 +157,38 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
         )
         self.input_batch = input_batch
         return input_batch
+
+    def _run_encode_only_stage(
+        self,
+        states: list[DiffusionRequestState],
+        new_request_ids: list[str],
+    ) -> BatchRunnerOutput:
+        if len(states) != len(new_request_ids):
+            raise ValueError("Encode-only diffusion stages do not support cached step requests.")
+        outputs: list[RunnerOutput] = []
+        for state in states:
+            clear_pipeline_stage_durations(self.pipeline)
+            state = self.pipeline.init_state(state)
+            state = self.pipeline.check_inputs(state)
+            state = self.pipeline.encode(state)
+            merge_stage_durations(
+                state,
+                consume_pipeline_stage_durations(self.pipeline),
+            )
+            payload = self.pipeline.pack_stage_state(state, StageBoundary.ENCODE_TO_DIT)
+            custom_output = self._send_typed_stage_payload(payload)
+            result = DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True)
+            attach_stage_durations(state, result)
+            outputs.append(
+                RunnerOutput(
+                    request_id=state.request_id,
+                    step_index=0,
+                    finished=True,
+                    result=result,
+                )
+            )
+            self.state_cache.pop(state.request_id, None)
+        return BatchRunnerOutput.from_list(outputs)
 
     def _update_states_after(
         self,
@@ -241,6 +291,8 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
             states, new_request_ids = self._update_states(scheduler_output)
             if not states:
                 return BatchRunnerOutput.from_list([])
+            if self._stage_role() == DiffusionStageRole.ENCODE:
+                return self._run_encode_only_stage(states, new_request_ids)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
                 current_omni_platform.reset_peak_memory_stats()
