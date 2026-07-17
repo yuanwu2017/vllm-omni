@@ -3,7 +3,9 @@
 
 import pytest
 
+from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion import io_support
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -55,3 +57,32 @@ def test_dummy_run_num_frames_uses_audio_input_fallback(monkeypatch: pytest.Monk
     )
 
     assert io_support.get_dummy_run_num_frames("unknown", supports_audio_input=True) == 2
+
+
+@pytest.mark.parametrize("stage_role", [DiffusionStageRole.DENOISE, DiffusionStageRole.DECODE])
+def test_dummy_run_skips_stage_roles_that_require_upstream_payload(stage_role: DiffusionStageRole) -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = type("Config", (), {"stage_role": stage_role, "model_stage": None})()
+
+    engine._dummy_run()
+
+
+def test_dummy_run_does_not_skip_full_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = type(
+        "Config",
+        (),
+        {
+            "stage_role": DiffusionStageRole.FULL,
+            "model_stage": None,
+            "model_class_name": "video_only",
+        },
+    )()
+    engine.pre_process_func = None
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
+        lambda _config: (False, False),
+    )
+    monkeypatch.setattr(engine, "add_req_and_wait_for_response", lambda _request: type("Output", (), {"error": None})())
+
+    engine._dummy_run()

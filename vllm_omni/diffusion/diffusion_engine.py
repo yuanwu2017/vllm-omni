@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.config.stage_config import DiffusionStageRole, resolve_diffusion_stage_role
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     DiffusionRequestAbortedError,
@@ -771,6 +772,14 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        stage_role = resolve_diffusion_stage_role(
+            getattr(self.od_config, "stage_role", None),
+            getattr(self.od_config, "model_stage", None),
+        )
+        if stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DECODE):
+            logger.info("Skipping dummy warmup run for diffusion stage role %s", stage_role.value)
+            return
+
         num_inference_steps = 1
         height = 512
         width = 512
