@@ -8,11 +8,15 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 as wan22_module
+from vllm_omni.config.stage_config import DiffusionStageRole
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    Wan22Pipeline,
     create_transformer_from_config,
     load_transformer_config,
     retrieve_latents,
 )
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -79,3 +83,106 @@ def test_create_transformer_from_config_maps_supported_keys(monkeypatch) -> None
         "out_channels": 16,
         "text_dim": 4096,
     }
+
+
+def test_wan_denoise_outputs_split_latents_per_request() -> None:
+    requests = [SimpleNamespace(request_id=f"req-{idx}") for idx in range(2)]
+    batch = DiffusionRequestBatch(requests=requests)
+    latents = torch.arange(4 * 2 * 1 * 1 * 1, dtype=torch.float32).view(4, 2, 1, 1, 1)
+
+    outputs = Wan22Pipeline._denoise_outputs(batch, latents, num_outputs_per_prompt=2)
+
+    assert len(outputs) == 2
+    torch.testing.assert_close(outputs[0].custom_output["latents"], latents[:2])
+    torch.testing.assert_close(outputs[1].custom_output["latents"], latents[2:])
+    assert all(output.output is None for output in outputs)
+
+
+def test_wan_denoise_outputs_reject_mismatched_batch() -> None:
+    batch = DiffusionRequestBatch(requests=[SimpleNamespace(request_id="req")])
+
+    with pytest.raises(ValueError, match="expected 2"):
+        Wan22Pipeline._denoise_outputs(batch, torch.zeros(1, 2, 1, 1, 1), num_outputs_per_prompt=2)
+
+
+def test_wan_decode_batch_consumes_latents_with_vae_only() -> None:
+    class FakeVAE:
+        dtype = torch.float32
+        config = SimpleNamespace(latents_mean=[0.0, 0.0], latents_std=[1.0, 1.0], z_dim=2)
+
+        def __init__(self) -> None:
+            self.inputs = []
+
+        def decode(self, latents, return_dict=False):
+            assert return_dict is False
+            self.inputs.append(latents)
+            return (latents + 1,)
+
+    pipeline = object.__new__(Wan22Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.vae = FakeVAE()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    request = SimpleNamespace(
+        prompt={"latents": latents},
+        sampling_params=SimpleNamespace(output_type="np"),
+    )
+
+    outputs = pipeline.decode_batch(DiffusionRequestBatch(requests=[request]))
+
+    assert len(pipeline.vae.inputs) == 1
+    torch.testing.assert_close(outputs[0].output, latents + 1)
+
+
+def test_wan_decode_batch_requires_latent_payload() -> None:
+    pipeline = object.__new__(Wan22Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    request = SimpleNamespace(prompt={}, sampling_params=SimpleNamespace(output_type="np"))
+
+    with pytest.raises(ValueError, match="requires a tensor 'latents'"):
+        pipeline.decode_batch(DiffusionRequestBatch(requests=[request]))
+
+
+def test_wan_denoise_dummy_run_synthesizes_prompt_embeds() -> None:
+    pipeline = object.__new__(Wan22Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.stage_role = DiffusionStageRole.DENOISE
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = SimpleNamespace(dtype=torch.float32)
+    pipeline.transformer_config = SimpleNamespace(text_dim=8)
+    pipeline.forward = lambda batch: (
+        batch.requests[0].prompt["prompt_embeds"],
+        batch.requests[0].prompt["negative_prompt_embeds"],
+    )
+    request = SimpleNamespace(
+        request_id=DUMMY_DIFFUSION_REQUEST_ID,
+        is_dummy_run_request_id=lambda request_id: request_id == DUMMY_DIFFUSION_REQUEST_ID,
+        prompt={"prompt": "dummy run"},
+        sampling_params=SimpleNamespace(max_sequence_length=4),
+    )
+
+    prompt_embeds, negative_prompt_embeds = pipeline.run_stage(DiffusionRequestBatch(requests=[request]))
+
+    assert prompt_embeds.shape == (1, 4, 8)
+    torch.testing.assert_close(negative_prompt_embeds, torch.zeros_like(prompt_embeds))
+
+
+def test_wan_decode_dummy_run_synthesizes_latents() -> None:
+    pipeline = object.__new__(Wan22Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.stage_role = DiffusionStageRole.DECODE
+    pipeline.device = torch.device("cpu")
+    pipeline.vae = SimpleNamespace(dtype=torch.float32, config=SimpleNamespace(z_dim=16))
+    pipeline.vae_scale_factor_temporal = 4
+    pipeline.vae_scale_factor_spatial = 8
+    pipeline.decode_batch = lambda batch: batch.requests[0].prompt["latents"]
+    request = SimpleNamespace(
+        request_id=DUMMY_DIFFUSION_REQUEST_ID,
+        is_dummy_run_request_id=lambda request_id: request_id == DUMMY_DIFFUSION_REQUEST_ID,
+        prompt={"prompt": "dummy run"},
+        sampling_params=SimpleNamespace(height=64, width=96, num_frames=9),
+    )
+
+    result = pipeline.run_stage(DiffusionRequestBatch(requests=[request]))
+
+    assert result.shape == (1, 16, 3, 8, 12)

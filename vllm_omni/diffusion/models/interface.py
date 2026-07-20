@@ -114,9 +114,8 @@ def supports_step_execution(pipeline: object) -> bool:
 _ROLE_COMPONENT_GROUPS: dict[str, frozenset[str]] = {
     "full": frozenset({"encoder", "dit", "vae"}),
     "encode": frozenset({"encoder"}),
-    # DENOISE consumes upstream embeddings and produces the final media, so it
-    # runs the transformer(s) and the VAE decode (fused generation stage).
-    "denoise": frozenset({"dit", "vae"}),
+    "denoise": frozenset({"dit"}),
+    "denoise_decode": frozenset({"dit", "vae"}),
     "decode": frozenset({"vae"}),
 }
 

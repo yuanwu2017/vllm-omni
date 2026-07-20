@@ -35,6 +35,7 @@ _DIFFUSION_HANDOFF = "vllm_omni.model_executor.stage_input_processors.diffusion_
 
 # Prompt-embedding payload transferred across the encode -> denoise edge.
 _ENCODE_PAYLOAD_KEYS = ("prompt_embeds", "negative_prompt_embeds")
+_DENOISE_PAYLOAD_KEYS = ("latents",)
 
 
 # --- Single-stage full pipeline ---------------------------------------------
@@ -81,9 +82,54 @@ WAN2_2_EG_PIPELINE = PipelineConfig(
             stage_id=1,
             model_stage="dit",
             execution_type=StageExecutionType.DIFFUSION,
-            stage_role=DiffusionStageRole.DENOISE,
+            stage_role=DiffusionStageRole.DENOISE_DECODE,
             stage_payload_keys=_ENCODE_PAYLOAD_KEYS,
             input_sources=(0,),
+            final_output=True,
+            final_output_type="video",
+            model_arch=_WAN_MODEL_ARCH,
+            custom_process_input_func=_DIFFUSION_HANDOFF,
+        ),
+    ),
+)
+
+
+# --- Encode/Denoise/Decode (EGD): 3-stage disaggregation -------------------
+WAN2_2_EGD_PIPELINE = PipelineConfig(
+    model_type="wan2_2_egd",
+    model_arch=_WAN_MODEL_ARCH,
+    diffusers_class_name="WanPipeline",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="text_encode",
+            execution_type=StageExecutionType.DIFFUSION,
+            stage_role=DiffusionStageRole.ENCODE,
+            stage_payload_keys=_ENCODE_PAYLOAD_KEYS,
+            input_sources=(),
+            final_output=False,
+            model_arch=_WAN_MODEL_ARCH,
+            engine_output_type="custom",
+        ),
+        StagePipelineConfig(
+            stage_id=1,
+            model_stage="denoise",
+            execution_type=StageExecutionType.DIFFUSION,
+            stage_role=DiffusionStageRole.DENOISE,
+            stage_payload_keys=_DENOISE_PAYLOAD_KEYS,
+            input_sources=(0,),
+            final_output=False,
+            model_arch=_WAN_MODEL_ARCH,
+            engine_output_type="custom",
+            custom_process_input_func=_DIFFUSION_HANDOFF,
+        ),
+        StagePipelineConfig(
+            stage_id=2,
+            model_stage="decode",
+            execution_type=StageExecutionType.DIFFUSION,
+            stage_role=DiffusionStageRole.DECODE,
+            stage_payload_keys=_DENOISE_PAYLOAD_KEYS,
+            input_sources=(1,),
             final_output=True,
             final_output_type="video",
             model_arch=_WAN_MODEL_ARCH,

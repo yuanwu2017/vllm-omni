@@ -191,9 +191,10 @@ class DiffusionStageRole(str, Enum):
                    stage. This is the default / single-stage behavior.
     - ``ENCODE``:  run only the (text/image) encoder(s) and emit conditioning
                    embeddings for a downstream stage.
-    - ``DENOISE``: run the DiT denoise loop consuming upstream embeddings,
-                   fused with VAE decode (the generation stage of E/G
-                   disaggregation).
+    - ``DENOISE``: run only the DiT denoise loop consuming upstream embeddings
+                   and emit latents for a downstream decode stage.
+    - ``DENOISE_DECODE``: run the DiT denoise loop and VAE decode together (the
+                          generation stage of E/G disaggregation).
     - ``DECODE``:  run only the VAE decode on upstream latents (the trailing
                    stage of a 3-way E/G/D split).
     """
@@ -201,6 +202,7 @@ class DiffusionStageRole(str, Enum):
     FULL = "full"
     ENCODE = "encode"
     DENOISE = "denoise"
+    DENOISE_DECODE = "denoise_decode"
     DECODE = "decode"
 
 
@@ -210,8 +212,9 @@ class DiffusionStageRole(str, Enum):
 _MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
     "text_encode": DiffusionStageRole.ENCODE,
     "encode": DiffusionStageRole.ENCODE,
-    "dit": DiffusionStageRole.DENOISE,
+    "dit": DiffusionStageRole.DENOISE_DECODE,
     "denoise": DiffusionStageRole.DENOISE,
+    "denoise_decode": DiffusionStageRole.DENOISE_DECODE,
     "decode": DiffusionStageRole.DECODE,
     "vae_decode": DiffusionStageRole.DECODE,
     "diffusion": DiffusionStageRole.FULL,

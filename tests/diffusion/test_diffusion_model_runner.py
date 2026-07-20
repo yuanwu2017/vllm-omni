@@ -163,6 +163,35 @@ def _make_compile_runner(*, use_hsdp: bool):
     return runner
 
 
+class _FakeStageConnector:
+    def __init__(self, recv_payload=None, fail_put: bool = False):
+        self.recv_payload = recv_payload
+        self.fail_put = fail_put
+        self.get_calls = []
+        self.put_calls = []
+
+    def get(self, from_stage, to_stage, key, metadata=None):
+        self.get_calls.append((from_stage, to_stage, key, metadata))
+        return self.recv_payload
+
+    def put(self, from_stage, to_stage, key, payload):
+        self.put_calls.append((from_stage, to_stage, key, payload))
+        if self.fail_put:
+            raise RuntimeError("put failed")
+        return True, sum(tensor.numel() * tensor.element_size() for tensor in payload.values()), {"handle": key}
+
+
+def _make_stage_payload_runner(connector, payload_keys=("latents",)):
+    runner = object.__new__(DiffusionModelRunner)
+    runner.device = torch.device("cpu")
+    runner.od_config = SimpleNamespace(stage_payload_keys=payload_keys)
+    runner.kv_transfer_manager = SimpleNamespace(
+        connector=connector,
+        config=SimpleNamespace(from_stage="1", to_stage="2"),
+    )
+    return runner
+
+
 @pytest.mark.core_model
 @pytest.mark.cpu
 @pytest.mark.parametrize("use_hsdp", [False, True])
@@ -185,6 +214,55 @@ def test_compile_transformer_regionally_compiles_blocks(monkeypatch, use_hsdp):
             {"dynamic": True},
         )
     ]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_middle_diffusion_stage_receives_then_sends_payload():
+    prompt_embeds = torch.ones(1, 2, 3)
+    connector = _FakeStageConnector(recv_payload=({"prompt_embeds": prompt_embeds}, prompt_embeds.nbytes))
+    runner = _make_stage_payload_runner(connector)
+    request = SimpleNamespace(
+        request_id="req-middle",
+        prompt={
+            "_stage_payload_transfer": {
+                "key": "req-middle:encode",
+                "from_stage": "0",
+                "to_stage": "1",
+                "metadata": {"edge": "encode"},
+                "payload_keys": ["prompt_embeds"],
+            }
+        },
+    )
+
+    runner._maybe_recv_stage_payload(request)
+
+    assert connector.get_calls == [("0", "1", "req-middle:encode", {"edge": "encode"})]
+    torch.testing.assert_close(request.prompt["prompt_embeds"], prompt_embeds)
+
+    latents = torch.zeros(1, 4, 2, 2, 2)
+    output = DiffusionOutput(custom_output={"latents": latents})
+    runner._maybe_send_stage_payload([request], [output])
+
+    assert connector.put_calls[0][:3] == ("1", "2", "req-middle:stage_payload")
+    torch.testing.assert_close(connector.put_calls[0][3]["latents"], latents)
+    assert output.custom_output["_stage_payload_transfer"]["from_stage"] == "1"
+    assert output.custom_output["_stage_payload_transfer"]["to_stage"] == "2"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_stage_payload_put_failure_preserves_inline_fallback():
+    connector = _FakeStageConnector(fail_put=True)
+    runner = _make_stage_payload_runner(connector)
+    request = SimpleNamespace(request_id="req-fallback")
+    latents = torch.ones(1, 4, 2, 2, 2)
+    output = DiffusionOutput(custom_output={"latents": latents})
+
+    runner._maybe_send_stage_payload([request], [output])
+
+    torch.testing.assert_close(output.custom_output["latents"], latents)
+    assert "_stage_payload_transfer" not in output.custom_output
 
 
 @pytest.mark.core_model
