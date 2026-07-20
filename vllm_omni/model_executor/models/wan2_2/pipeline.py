@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Wan2.x disaggregated diffusion pipeline topologies (frozen).
+"""Wan2.x diffusion pipeline topologies (frozen).
 
 Wan runs as a single-stage diffusion model by default (text-encode + DiT
 denoise + VAE decode fused on one worker). These topologies describe the
@@ -31,9 +31,7 @@ from vllm_omni.config.stage_config import (
 )
 
 _WAN_MODEL_ARCH = "WanPipeline"
-_DIFFUSION_HANDOFF = (
-    "vllm_omni.model_executor.stage_input_processors.diffusion_disagg.diffusion_stage_handoff"
-)
+_DIFFUSION_HANDOFF = "vllm_omni.model_executor.stage_input_processors.diffusion_disagg.diffusion_stage_handoff"
 
 # Prompt-embedding payload transferred across the encode -> denoise edge.
 _ENCODE_PAYLOAD_KEYS = ("prompt_embeds", "negative_prompt_embeds")
@@ -90,6 +88,25 @@ WAN2_2_EG_PIPELINE = PipelineConfig(
             final_output_type="video",
             model_arch=_WAN_MODEL_ARCH,
             custom_process_input_func=_DIFFUSION_HANDOFF,
+        ),
+    ),
+)
+
+
+# --- Single-stage TI2V pipeline --------------------------------------------
+WAN2_2_TI2V_PIPELINE = PipelineConfig(
+    model_type="wan2_2_ti2v",
+    model_arch=_WAN_MODEL_ARCH,
+    diffusers_class_name="WanPipeline",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="dit",
+            execution_type=StageExecutionType.DIFFUSION,
+            input_sources=(),
+            final_output=True,
+            final_output_type="video",
+            model_arch=_WAN_MODEL_ARCH,
         ),
     ),
 )

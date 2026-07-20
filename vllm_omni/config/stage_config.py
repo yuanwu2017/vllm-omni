@@ -220,7 +220,7 @@ _MODEL_STAGE_TO_ROLE: dict[str, DiffusionStageRole] = {
 
 
 def resolve_diffusion_stage_role(
-    stage_role: "DiffusionStageRole | str | None",
+    stage_role: DiffusionStageRole | str | None,
     model_stage: str | None = None,
 ) -> DiffusionStageRole:
     """Resolve the effective diffusion stage role.
@@ -347,6 +347,9 @@ class PipelineConfig:
     # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
     diffusers_class_name: str | None = None
     endpoint_restrictions: tuple[EndpointRestriction, ...] = ()
+    # Bundled deploy defaults for this concrete pipeline topology. The file is
+    # loaded from vllm_omni/deploy; None uses DeployConfig defaults.
+    default_deploy_config_name: str | None = None
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""
