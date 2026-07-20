@@ -89,6 +89,7 @@ from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
 from vllm_omni.model_executor.models.wan2_2.pipeline import (
     WAN2_2_EG_PIPELINE,
+    WAN2_2_EGD_PIPELINE,
     WAN2_2_PIPELINE,
 )
 
@@ -141,6 +142,8 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "wan2_2": WAN2_2_PIPELINE,
     # Disaggregated diffusion variant (opt-in): Wan Encode/Generation split.
     "wan2_2_eg": WAN2_2_EG_PIPELINE,
+    # Disaggregated diffusion variant (opt-in): Encode/Generation/Decode split.
+    "wan2_2_egd": WAN2_2_EGD_PIPELINE,
 }
 
 

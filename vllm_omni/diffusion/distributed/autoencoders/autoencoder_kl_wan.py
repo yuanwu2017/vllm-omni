@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from diffusers.models import modeling_utils as diffusers_modeling_utils
 from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
@@ -52,7 +53,13 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
 class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
-        model = super().from_pretrained(*args, **kwargs)
+        empty_device_cache = diffusers_modeling_utils.empty_device_cache
+        if current_omni_platform.is_xpu():
+            diffusers_modeling_utils.empty_device_cache = lambda: None
+        try:
+            model = super().from_pretrained(*args, **kwargs)
+        finally:
+            diffusers_modeling_utils.empty_device_cache = empty_device_cache
         model.init_distributed()
         return model
 

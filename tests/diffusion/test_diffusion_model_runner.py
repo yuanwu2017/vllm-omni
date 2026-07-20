@@ -325,6 +325,107 @@ def test_runner_v2_denoise_stage_requires_encode_payload():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
+def test_runner_v2_pure_denoise_emits_latents_without_decode(monkeypatch):
+    runner = object.__new__(DiffusionModelRunnerV2)
+    runner.vllm_config = object()
+    runner.device = torch.device("cpu")
+    runner.pipeline = _ChunkStepPipeline([DiffusionOutput(output="unused")])
+    runner.state_cache = {}
+    runner.od_config = SimpleNamespace(
+        stage_role="denoise",
+        model_stage="denoise",
+        cache_backend=None,
+        parallel_config=_StepParallelConfig(),
+        streaming_output=False,
+        cfg_kv_collect_func=None,
+    )
+    runner.kv_transfer_manager = _NoopKVTransferManager()
+    runner._recv_typed_stage_payload = lambda request_id, prompt: StagePayload(
+        request_id=request_id,
+        boundary=StageBoundary.ENCODE_TO_DIT,
+        scalar_fields={},
+        tensor_fields={},
+        private_scalar_fields={},
+        private_tensor_fields={},
+    )
+    sent_boundaries = []
+
+    def _send_payload(payload):
+        sent_boundaries.append(payload.boundary)
+        return {"stage_payload": DiffusionModelRunner._stage_payload_to_wire(payload)}
+
+    runner._send_typed_stage_payload = _send_payload
+    req = _make_request(skip_cache_refresh=True)
+    req.request_id = "req-denoise"
+    monkeypatch.setattr(model_runner_v2_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_v2_module, "current_omni_platform", _fake_platform_for_peak_memory())
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[SimpleNamespace(request_id=req.request_id, req=req)],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[]),
+    )
+
+    first = runner.execute_stepwise(scheduler_output)
+    assert first.get_request_output(req.request_id).result is None
+
+    scheduler_output = SimpleNamespace(
+        finished_req_ids=set(),
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(request_ids=[req.request_id]),
+    )
+    second = runner.execute_stepwise(scheduler_output)
+    output = second.get_request_output(req.request_id)
+
+    assert output.finished
+    assert output.result is not None
+    assert output.result.output is None
+    assert sent_boundaries == [StageBoundary.DIT_TO_DECODE]
+    assert runner.pipeline.decode_calls == 0
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_runner_v2_decode_only_validates_and_consumes_latent_payload():
+    runner = object.__new__(DiffusionModelRunnerV2)
+    runner.device = torch.device("cpu")
+    final_result = DiffusionOutput(output="video")
+    runner.pipeline = _ChunkStepPipeline([final_result])
+    runner.state_cache = {}
+    sampling = OmniDiffusionSamplingParams(num_inference_steps=2)
+    state = DiffusionRequestState(request_id="req-decode", sampling=sampling, prompt={})
+    runner.state_cache[state.request_id] = state
+
+    wrong_payload = StagePayload(
+        request_id=state.request_id,
+        boundary=StageBoundary.ENCODE_TO_DIT,
+        scalar_fields={},
+        tensor_fields={},
+        private_scalar_fields={},
+        private_tensor_fields={},
+    )
+    runner._recv_typed_stage_payload = lambda request_id, prompt: wrong_payload
+    with pytest.raises(ValueError, match="expected 'dit_to_decode'"):
+        runner._run_decode_only_stage([state], [state.request_id])
+
+    latent_payload = StagePayload(
+        request_id=state.request_id,
+        boundary=StageBoundary.DIT_TO_DECODE,
+        scalar_fields={},
+        tensor_fields={"latents": torch.ones(1, 1)},
+        private_scalar_fields={},
+        private_tensor_fields={},
+    )
+    runner._recv_typed_stage_payload = lambda request_id, prompt: latent_payload
+    output = runner._run_decode_only_stage([state], [state.request_id]).get_request_output(state.request_id)
+
+    assert output.finished
+    assert output.result == final_result
+    assert runner.pipeline.decode_calls == 1
+    assert state.request_id not in runner.state_cache
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_diffusion_output_moves_custom_output_tensors_to_cpu():
     class TrackingTensor(torch.Tensor):
         cpu_called = False

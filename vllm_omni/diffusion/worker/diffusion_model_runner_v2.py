@@ -136,7 +136,7 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
                 continue
             self._prepare_generator(state)
             payload = None
-            if stage_role == DiffusionStageRole.DENOISE:
+            if stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DENOISE_DECODE):
                 payload = self._recv_typed_stage_payload(state.request_id, state.prompt)
                 if payload is None:
                     raise ValueError(f"Denoise stage requires an ENCODE_TO_DIT payload for request {state.request_id}.")
@@ -183,6 +183,37 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
                 RunnerOutput(
                     request_id=state.request_id,
                     step_index=0,
+                    finished=True,
+                    result=result,
+                )
+            )
+            self.state_cache.pop(state.request_id, None)
+        return BatchRunnerOutput.from_list(outputs)
+
+    def _run_decode_only_stage(
+        self,
+        states: list[DiffusionRequestState],
+        new_request_ids: list[str],
+    ) -> BatchRunnerOutput:
+        if len(states) != len(new_request_ids):
+            raise ValueError("Decode-only diffusion stages do not support cached step requests.")
+        outputs: list[RunnerOutput] = []
+        for state in states:
+            self._prepare_generator(state)
+            payload = self._recv_typed_stage_payload(state.request_id, state.prompt)
+            if payload is None:
+                raise ValueError(f"Decode stage requires a DIT_TO_DECODE payload for request {state.request_id}.")
+            if payload.boundary != StageBoundary.DIT_TO_DECODE:
+                raise ValueError(
+                    f"Decode stage received {payload.boundary.value!r} for request "
+                    f"{state.request_id}; expected {StageBoundary.DIT_TO_DECODE.value!r}."
+                )
+            state = self.pipeline.init_state(state)
+            result = self.run_decode_stage(state, payload=payload)
+            outputs.append(
+                RunnerOutput(
+                    request_id=state.request_id,
+                    step_index=state.step_index,
                     finished=True,
                     result=result,
                 )
@@ -291,8 +322,11 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
             states, new_request_ids = self._update_states(scheduler_output)
             if not states:
                 return BatchRunnerOutput.from_list([])
-            if self._stage_role() == DiffusionStageRole.ENCODE:
+            stage_role = self._stage_role()
+            if stage_role == DiffusionStageRole.ENCODE:
                 return self._run_encode_only_stage(states, new_request_ids)
+            if stage_role == DiffusionStageRole.DECODE:
+                return self._run_decode_only_stage(states, new_request_ids)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if new_request_ids and not had_active_states and is_primary and current_omni_platform.is_available():
                 current_omni_platform.reset_peak_memory_stats()
@@ -316,7 +350,13 @@ class DiffusionModelRunnerV2(DiffusionModelRunner):
                         state.chunk_denoise_completed if self.od_config.streaming_output else state.denoise_completed
                     )
 
-                    result = self.run_decode_stage(state) if should_decode else None
+                    if should_decode and stage_role == DiffusionStageRole.DENOISE:
+                        payload = self.pipeline.pack_stage_state(state, StageBoundary.DIT_TO_DECODE)
+                        custom_output = self._send_typed_stage_payload(payload)
+                        result = DiffusionOutput(output=None, custom_output=custom_output, to_cpu=True)
+                        attach_stage_durations(state, result)
+                    else:
+                        result = self.run_decode_stage(state) if should_decode else None
                     finished = (
                         state.request_denoise_completed if self.od_config.streaming_output else state.denoise_completed
                     )

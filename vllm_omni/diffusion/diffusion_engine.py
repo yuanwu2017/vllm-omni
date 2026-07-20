@@ -776,7 +776,11 @@ class DiffusionEngine:
             getattr(self.od_config, "stage_role", None),
             getattr(self.od_config, "model_stage", None),
         )
-        if stage_role in (DiffusionStageRole.DENOISE, DiffusionStageRole.DECODE):
+        if stage_role in (
+            DiffusionStageRole.DENOISE,
+            DiffusionStageRole.DENOISE_DECODE,
+            DiffusionStageRole.DECODE,
+        ):
             logger.info("Skipping dummy warmup run for diffusion stage role %s", stage_role.value)
             return
 

@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for out of tree registration to OMNI_PIPELINES."""
 
+from pathlib import Path
+
 import pytest
 from transformers import PretrainedConfig
 
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, register_pipeline
-from vllm_omni.config.stage_config import PipelineConfig, pipeline_cfg_resolver
+from vllm_omni.config.stage_config import (
+    DiffusionStageRole,
+    PipelineConfig,
+    load_deploy_config,
+    pipeline_cfg_resolver,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -66,3 +73,25 @@ def test_register_resolver_requires_model_type(custom_resolver, clean_pipeline_r
     """Ensure that registering a custom resolver to OMNI_PIPELINES requires an explicit model_type."""
     with pytest.raises(ValueError):
         register_pipeline(custom_resolver)
+
+
+def test_wan_egd_pipeline_and_deploy_wiring():
+    pipeline = OMNI_PIPELINES["wan2_2_egd"]
+    assert isinstance(pipeline, PipelineConfig)
+    assert [stage.stage_role for stage in pipeline.stages] == [
+        DiffusionStageRole.ENCODE,
+        DiffusionStageRole.DENOISE,
+        DiffusionStageRole.DECODE,
+    ]
+    assert pipeline.stages[0].stage_payload_keys == ("prompt_embeds", "negative_prompt_embeds")
+    assert pipeline.stages[1].stage_payload_keys == ("latents",)
+    assert pipeline.stages[2].final_output_type == "video"
+
+    deploy_path = Path(__file__).parents[2] / "vllm_omni" / "deploy" / "wan2_2_egd.yaml"
+    deploy = load_deploy_config(deploy_path)
+    assert deploy.pipeline == "wan2_2_egd"
+    assert len(deploy.stages) == 3
+    assert deploy.stages[0].output_connectors == {"to_stage_1": "wan_encode_connector"}
+    assert deploy.stages[1].input_connectors == {"from_stage_0": "wan_encode_connector"}
+    assert deploy.stages[1].output_connectors == {"to_stage_2": "wan_latent_connector"}
+    assert deploy.stages[2].input_connectors == {"from_stage_1": "wan_latent_connector"}
