@@ -143,19 +143,29 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-cache --no-build-isolation .
 
 ARG NIXL_VERSION=v1.3.0
+COPY docker/build_nixl_wheels.sh /tmp/build_nixl_wheels.sh
+COPY docker/nixl-wheelhouse/ /tmp/nixl-wheelhouse/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    git clone --depth 1 --branch ${NIXL_VERSION} https://github.com/ai-dynamo/nixl.git /tmp/nixl && \
-    cd /tmp/nixl && \
-    uv pip install --no-cache meson meson-python ninja pybind11 tomlkit pyyaml build && \
-    uv pip install --no-cache --no-build-isolation --no-deps . && \
-    meson setup build \
-        -Ducx_path=/opt/venv \
-        -Denable_plugins=UCX \
-        -Ddisable_gds_backend=true && \
-    ninja -C build install && \
-    uv pip install --no-cache build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl && \
+    set -euxo pipefail; \
+    local_wheel_dir="/tmp/nixl-wheelhouse/${NIXL_VERSION}"; \
+    native_wheel="$(find "${local_wheel_dir}" -maxdepth 1 -type f \
+        -name 'nixl_cu12-*.whl' -print -quit 2>/dev/null || true)"; \
+    meta_wheel="$(find "${local_wheel_dir}" -maxdepth 1 -type f \
+        -name 'nixl-*.whl' ! -name 'nixl_cu12-*.whl' -print -quit \
+        2>/dev/null || true)"; \
+    if [[ -n "${native_wheel}" && -n "${meta_wheel}" ]] && \
+        uv pip install --no-cache "${native_wheel}" "${meta_wheel}"; then \
+        echo "Installed NIXL ${NIXL_VERSION} from local wheels in ${local_wheel_dir}"; \
+    else \
+        mkdir -p /tmp/nixl-built; \
+        bash /tmp/build_nixl_wheels.sh \
+            "${NIXL_VERSION}" /tmp/nixl-built "${VIRTUAL_ENV}"; \
+        uv pip install --no-cache \
+            /tmp/nixl-built/nixl_cu12-*.whl \
+            /tmp/nixl-built/nixl-*.whl; \
+    fi; \
     python -c "import nixl; agent = nixl.nixl_agent('agent1')" && \
-    rm -rf /tmp/nixl
+    rm -rf /tmp/build_nixl_wheels.sh /tmp/nixl-wheelhouse /tmp/nixl-built
 
 CMD ["/bin/bash"]
 
