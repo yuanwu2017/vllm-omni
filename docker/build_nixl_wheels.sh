@@ -18,7 +18,7 @@ mkdir -p "${OUTPUT_DIR}"
 git clone --depth 1 --branch "${NIXL_VERSION}" https://github.com/ai-dynamo/nixl.git "${SOURCE_DIR}"
 cd "${SOURCE_DIR}"
 
-uv pip install --no-cache \
+uv pip install \
   build \
   meson \
   meson-python \
