@@ -94,30 +94,24 @@ WORKDIR /workspace/
 ENV UV_HTTP_TIMEOUT=500
 
 ARG UCX_VERSION=v1.21.0
-RUN git clone --depth 1 --branch ${UCX_VERSION} https://github.com/openucx/ucx.git /tmp/ucx && \
-    cd /tmp/ucx && \
-    ./autogen.sh && \
-    ./contrib/configure-release-mt \
-        --prefix=/usr/local \
-        --enable-shared \
-        --disable-static \
-        --disable-doxygen-doc \
-        --enable-optimizations \
-        --enable-cma \
-        --enable-devel-headers \
-        --enable-mt \
-        --with-ze \
-        --with-verbs \
-        --with-rdmacm \
-        --without-cuda \
-        --without-rocm \
-        --without-gdrcopy && \
-    make -j"$(nproc)" install-strip && \
-    ldconfig && \
-    rm -rf /tmp/ucx
+COPY docker/build_ucx_wheel.sh /tmp/build_ucx_wheel.sh
+COPY docker/ucx-wheelhouse/ /tmp/ucx-wheelhouse/
+RUN set -euxo pipefail; \
+    package_version="${UCX_VERSION#v}"; \
+    local_wheel="$(find /tmp/ucx-wheelhouse -maxdepth 1 -type f \
+        -name "ucx_runtime-${package_version}-*.whl" -print -quit)"; \
+    if [[ -n "${local_wheel}" ]] && uv pip install --no-cache "${local_wheel}"; then \
+        echo "Installed UCX ${UCX_VERSION} from local wheel ${local_wheel}"; \
+    else \
+        mkdir -p /tmp/ucx-built; \
+        bash /tmp/build_ucx_wheel.sh "${UCX_VERSION}" /tmp/ucx-built "${VIRTUAL_ENV}"; \
+        uv pip install --no-cache /tmp/ucx-built/ucx_runtime-${package_version}-*.whl; \
+    fi; \
+    ldconfig; \
+    rm -rf /tmp/build_ucx_wheel.sh /tmp/ucx-wheelhouse /tmp/ucx-built
 
-ENV PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH"
-ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib/ucx:$LD_LIBRARY_PATH"
+ENV PKG_CONFIG_PATH="/opt/venv/lib/pkgconfig:$PKG_CONFIG_PATH"
+ENV LD_LIBRARY_PATH="/opt/venv/lib:/opt/venv/lib/ucx:$LD_LIBRARY_PATH"
 
 # Configure package index for XPU
 ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
@@ -155,7 +149,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-cache meson meson-python ninja pybind11 tomlkit pyyaml build && \
     uv pip install --no-cache --no-build-isolation --no-deps . && \
     meson setup build \
-        -Ducx_path=/usr/local \
+        -Ducx_path=/opt/venv \
         -Denable_plugins=UCX \
         -Ddisable_gds_backend=true && \
     ninja -C build install && \
