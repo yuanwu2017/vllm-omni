@@ -165,20 +165,36 @@ def _consumer(
     direct: bool,
     payload_kind: str,
 ) -> None:
-    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import NixlConnector
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+        OmniKVCacheConfig,
+        OmniKVTransferManager,
+    )
 
     if not ready.wait(timeout=30):
         raise TimeoutError("producer did not publish native NIXL metadata")
     current_omni_platform.set_device(1)
-    connector = NixlConnector(
-        {
-            "role": "receiver",
-            "sender_host": "127.0.0.1",
-            "sender_zmq_port": port,
-            "receive_device": "cuda",
-            "agent_name": "native-smoke-consumer",
-        }
+    manager = OmniKVTransferManager(
+        OmniKVCacheConfig(
+            connector_config={
+                "type": "NixlConnector",
+                "role": "receiver",
+                "host": "127.0.0.1",
+                "zmq_port": port,  # Shared deployment edge: already bound by producer.
+                "backends": ["UCX"],
+                "receive_device": "cuda",
+                "agent_name": "native-smoke-consumer",
+            },
+            from_stage="0",
+            to_stage="1",
+            stage_id=1,
+            need_recv_cache=direct,  # Exercise both payload-only and KV receiver setup.
+        )
     )
+    manager.update_sender_info({"host": "127.0.0.1", "zmq_port": port})
+    connector = manager.connector
+    assert connector is not None, "Receiver must not bind the producer's occupied port"
+    assert connector._zmq_port is None and not connector._serving_handshake
+    assert connector._backends == ["UCX"]
     try:
         original_wait = connector._wait_for_transfer
         states = []
