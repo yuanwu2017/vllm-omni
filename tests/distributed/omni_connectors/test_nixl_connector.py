@@ -25,6 +25,46 @@ pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 PORT = 47431
 
 
+def _wait_for_metadata(consumer, key, metadata=None, *, timeout=2.0):
+    """Retry outside the connector's deliberately bounded metadata query."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resolved = consumer._resolve_metadata(key, metadata)
+        if resolved is not None:
+            return resolved
+        time.sleep(0.01)
+    pytest.fail(f"Timed out waiting for metadata for {key!r}")
+
+
+@pytest.mark.parametrize("misses", [0, 2])
+def test_wait_for_metadata_retries_until_success(monkeypatch, misses):
+    expected = {"claim_id": "claim"}
+    forwarded = {"source_host": "127.0.0.1", "source_port": PORT}
+    calls = []
+
+    def resolve(key, metadata):
+        calls.append((key, metadata))
+        return None if len(calls) <= misses else expected
+
+    ticks = iter(range(10))
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    consumer = types.SimpleNamespace(_resolve_metadata=resolve)
+    assert _wait_for_metadata(consumer, "retry", forwarded, timeout=5) is expected
+    assert calls == [("retry", forwarded)] * (misses + 1)
+
+
+def test_wait_for_metadata_stops_at_deadline(monkeypatch):
+    calls = []
+    ticks = iter([0.0, 0.0, 1.0, 2.0])
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    consumer = types.SimpleNamespace(_resolve_metadata=lambda *args: calls.append(args))
+    with pytest.raises(pytest.fail.Exception, match="Timed out waiting for metadata for 'missing'"):
+        _wait_for_metadata(consumer, "missing")
+    assert calls == [("missing", None)] * 2
+
+
 @pytest.mark.parametrize("async_chunk", [False, True])
 def test_three_stage_incoming_and_outgoing_endpoints(nixl_connector_cls, async_chunk):
     from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
@@ -48,9 +88,13 @@ def test_three_stage_incoming_and_outgoing_endpoints(nixl_connector_cls, async_c
         assert middle._serving_handshake
         assert middle._zmq_port == PORT + 11
         first.put("0", "1", "incoming", torch.ones(1))
-        assert middle._resolve_metadata("incoming", None) is not None
+        incoming = _wait_for_metadata(middle, "incoming")
+        assert incoming["sender_zmq_port"] == PORT
+        assert incoming["generation"] == first._published["incoming"]["generation"]
         middle.put("1", "2", "outgoing", torch.ones(1))
-        assert last._resolve_metadata("outgoing", None) is not None
+        outgoing = _wait_for_metadata(last, "outgoing")
+        assert outgoing["sender_zmq_port"] == PORT + 11
+        assert outgoing["generation"] == middle._published["outgoing"]["generation"]
     finally:
         for connector in reversed(connectors):
             for pending in connector._pending.values():
@@ -95,6 +139,7 @@ def test_middle_stage_advertises_its_outgoing_replica_endpoint():
 
 
 @pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_claimed_source_survives_expiry_and_cleanup(producer, consumer, direct):
     _, _, metadata = producer.put("0", "1", "claimed", torch.ones(1))
     resolved = consumer._resolve_metadata("claimed", metadata if direct else None)
@@ -111,6 +156,7 @@ def test_claimed_source_survives_expiry_and_cleanup(producer, consumer, direct):
     assert producer._agent.registered == []
 
 
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_claims_are_generation_scoped_and_duplicate_ack_cannot_release_sibling(producer, consumer):
     _, _, original = producer.put("0", "1", "owners", torch.ones(1))
     first = consumer._resolve_metadata("owners", original)
@@ -129,6 +175,7 @@ def test_claims_are_generation_scoped_and_duplicate_ack_cannot_release_sibling(p
 
 
 @pytest.mark.parametrize("get_metadata", [None, {"schema_version": 1, "tensor_specs": [], "descriptor_groups": []}])
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_abandoned_claim_survives_close_and_late_completion(producer, consumer, get_metadata):
     _, _, metadata = producer.put("0", "1", "abandoned", torch.ones(1))
     claimed = consumer._resolve_metadata("abandoned", metadata)
@@ -342,6 +389,26 @@ def consumer(nixl_connector_cls):
     connector.close()
 
 
+@pytest.fixture
+def reliable_claim_queries(producer, consumer, monkeypatch):
+    """Ownership probes need exact claims, not claims retained after lost replies.
+
+    Exercise the real resolver, wire encoding and producer handler synchronously;
+    discovery tests separately cover bounded queries over real ZMQ sockets.
+    """
+    import uuid
+
+    from vllm_omni.distributed.omni_connectors.connectors.nixl_connector import _GET_META_MSG, _META_NOT_FOUND
+
+    def query(key, host, port, *, generation=None):
+        assert (host, port) == (producer.host, producer._zmq_port)
+        request = {"key": key, "generation": generation, "claim_id": uuid.uuid4().hex}
+        reply = producer._handle_handshake_message(_GET_META_MSG + msgspec.msgpack.encode(request))
+        return None if reply == _META_NOT_FOUND else msgspec.msgpack.decode(reply)
+
+    monkeypatch.setattr(consumer, "_query_metadata_at", query)
+
+
 def test_put_publishes_its_handshake_endpoint(producer):
     ok, size, metadata = producer.put("0", "1", "req-0", torch.arange(8, dtype=torch.float32))
 
@@ -358,7 +425,7 @@ def test_agent_uses_strict_thread_synchronization(producer):
 def test_handshake_serves_metadata_when_caller_has_none(producer, consumer):
     _, _, published = producer.put("0", "1", "req-1", torch.arange(4, dtype=torch.float32))
 
-    resolved = consumer._resolve_metadata("req-1", None)
+    resolved = _wait_for_metadata(consumer, "req-1")
 
     # msgpack has no tuple type, so region descriptors arrive as lists; get()
     # re-tuples them before handing them to NIXL.
@@ -412,6 +479,7 @@ def test_unknown_key_is_queried_once(producer, consumer, monkeypatch):
     assert socket.getsockopt(zmq.RCVTIMEO) == 10
 
 
+@pytest.mark.usefixtures("reliable_claim_queries")
 def test_transfer_done_releases_the_producer_buffer(producer, consumer):
     _, _, metadata = producer.put("0", "1", "req-3", torch.arange(4, dtype=torch.float32))
     assert producer._pending and producer._agent.registered
@@ -600,7 +668,7 @@ def test_payload_kinds_round_trip_through_the_handshake(producer, consumer, payl
     _, _, published = producer.put("0", "1", "req-kind", payload)
     assert published["kind"] == expected_kind
 
-    resolved = consumer._resolve_metadata("req-kind", None)
+    resolved = _wait_for_metadata(consumer, "req-kind")
 
     assert resolved["kind"] == expected_kind
     assert resolved["tensor_specs"] == published["tensor_specs"]

@@ -211,7 +211,8 @@ def test_prepare_ref2va_rejects_short_embedded_video_audio(monkeypatch):
         prepare_encoder_prompt(prompt, [sampling])
 
 
-def test_prepare_ref2va_rejects_combined_embedded_and_standalone_audio_duration(monkeypatch):
+@pytest.mark.parametrize("standalone_count", [1, 2])
+def test_prepare_ref2va_uses_separate_embedded_and_standalone_audio_budgets(monkeypatch, standalone_count):
     duration_seconds = 8.0
     sample_rate = 16_000
     _mock_ref2va_video_with_audio(monkeypatch, duration_seconds=duration_seconds)
@@ -225,12 +226,21 @@ def test_prepare_ref2va_rejects_combined_embedded_and_standalone_audio_duration(
         "prompt": "hello",
         "multi_modal_data": {
             "video": "original.mp4",
-            "audio": (torch.zeros(int(duration_seconds * sample_rate)), sample_rate),
+            "audio": [(torch.zeros(int(duration_seconds * sample_rate)), sample_rate) for _ in range(standalone_count)],
         },
     }
 
-    with pytest.raises(OmniClientError, match="at most 15 seconds in total"):
-        prepare_encoder_prompt(prompt, [sampling])
+    if standalone_count == 2:
+        with pytest.raises(OmniClientError, match="at most 15 seconds in total"):
+            prepare_encoder_prompt(prompt, [sampling])
+    else:
+        transformed = prepare_encoder_prompt(prompt, [sampling])
+        from vllm_omni.model_executor.models.minimax_h3.encoder import MiniMaxH3Encoder
+
+        media = MiniMaxH3Encoder._media_input(transformed["additional_information"])
+        assert len(media.video_audios) == 1 and len(media.audios) == 1
+        assert media.video_audios[0][0].shape[-1] == 8 * sample_rate
+        assert media.audios[0][0].shape[-1] == 8 * sample_rate
 
 
 def _encoder_output() -> dict:
