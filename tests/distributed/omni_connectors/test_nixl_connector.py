@@ -115,6 +115,89 @@ def test_explicit_sender_port_is_not_derived(name):
     assert resolve_connector_spec(spec, stage_id=1, role="receiver").extra["sender_zmq_port"] == 55000
 
 
+@pytest.mark.parametrize("need_recv_cache", [False, True])
+@pytest.mark.parametrize("update_before_init", [False, True])
+def test_manager_receiver_does_not_bind_shared_producer_port(producer, need_recv_cache, update_before_init):
+    """Payload-only and KV receivers must dial, not bind, the incoming edge."""
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+        OmniKVCacheConfig,
+        OmniKVTransferManager,
+    )
+
+    manager = OmniKVTransferManager(
+        OmniKVCacheConfig(
+            connector_config={
+                "type": "NixlConnector",
+                "role": "receiver",
+                "host": "127.0.0.1",
+                "zmq_port": PORT,
+                "backends": ["UCX"],
+            },
+            from_stage="0",
+            to_stage="1",
+            stage_id=1,
+            need_recv_cache=need_recv_cache,
+        )
+    )
+    sender_info = {"host": producer.host, "zmq_port": producer._zmq_port}
+    if update_before_init:
+        manager.update_sender_info(sender_info)
+    receiver = manager.connector
+    try:
+        assert receiver is not None, "Receiver incorrectly tried to bind the producer's occupied port"
+        assert receiver._zmq_port is None
+        assert not receiver._serving_handshake
+        if not update_before_init:
+            assert receiver._sender_zmq_port is None
+            manager.update_sender_info(sender_info)
+        assert receiver._sender_zmq_port == producer._zmq_port
+        assert manager.config.connector_config["zmq_port"] == PORT  # Do not mutate the shared specification.
+        success, _, _ = producer.put("0", "1", "manager-receive", torch.ones(1))
+        assert success
+        metadata = _wait_for_metadata(receiver, "manager-receive")
+        assert metadata["generation"] == producer._published["manager-receive"]["generation"]
+        receiver._notify_transfer_done("manager-receive", metadata)
+        assert not producer._pending
+    finally:
+        if receiver is not None:
+            receiver.close()
+
+
+@pytest.mark.parametrize("need_recv_cache", [False, True])
+def test_manager_receiver_preserves_explicit_standalone_sender(producer, need_recv_cache):
+    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
+        OmniKVCacheConfig,
+        OmniKVTransferManager,
+    )
+
+    manager = OmniKVTransferManager(
+        OmniKVCacheConfig(
+            connector_config={
+                "type": "NixlConnector",
+                "role": "receiver",
+                "zmq_port": PORT,
+                "sender_host": producer.host,
+                "sender_zmq_port": producer._zmq_port,
+            },
+            need_recv_cache=need_recv_cache,
+        )
+    )
+    receiver = manager.connector
+    try:
+        assert receiver is not None
+        assert receiver._zmq_port is None and not receiver._serving_handshake
+        assert (receiver._sender_host, receiver._sender_zmq_port) == (producer.host, producer._zmq_port)
+        success, _, _ = producer.put("0", "1", "standalone-receive", torch.ones(1))
+        assert success
+        metadata = _wait_for_metadata(receiver, "standalone-receive")
+        assert metadata["generation"] == producer._published["standalone-receive"]["generation"]
+        receiver._notify_transfer_done("standalone-receive", metadata)
+        assert not producer._pending
+    finally:
+        if receiver is not None:
+            receiver.close()
+
+
 def test_middle_stage_advertises_its_outgoing_replica_endpoint():
     from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 
